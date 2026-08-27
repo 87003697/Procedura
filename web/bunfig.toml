@@ -1,0 +1,5 @@
+# Bun fullstack dev server config.
+# The HTML entry (index.html) is bundled by Bun on the fly; bun-plugin-tailwind
+# compiles the `@import "tailwindcss"` in src/styles.css during that bundle.
+[serve.static]
+plugins = ["bun-plugin-tailwind"]

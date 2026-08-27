@@ -1,0 +1,17 @@
+node_modules/
+*.log
+.DS_Store
+bun.lockb
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# generated
+outputs/
+outputs
+dist/
+build/
+__pycache__/
+*.pyc

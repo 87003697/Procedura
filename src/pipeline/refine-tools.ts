@@ -1,0 +1,20 @@
+/** Tool allowlist for the refine stage (the agent loop). Passed to runLoop. */
+export const REFINE_TOOLS = new Set([
+  "render_views",
+  "compile",
+  "inspect_module",
+  "module_context",
+  "read_scad",
+  "edit_module",
+  "edit_modules",
+  "edit_full",
+  "move_parts",
+  "scale_parts",
+  "snap_floaters",
+  "accept_edit",
+  "revert_edit",
+  "check_connectivity",
+  "check_collisions",
+  "diagnose",
+  "finish",
+]);

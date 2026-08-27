@@ -1,0 +1,205 @@
+@import "tailwindcss";
+
+/*
+  Procedura Studio — design system.
+
+  Direction: Apple. Light, airy, neutral surfaces; one blue accent for every
+           interactive affordance; frosted sidebar and toolbars; generous
+           radii; type that leans on SF Pro (system) with Inter as the
+           stand-in where SF is not installed.
+  Theme:   light first, with the macOS dark appearance following the OS.
+           Every colour is a token; components never name a colour.
+  Status:  ok / warn / err / info use the system colours, at label darkness on
+           light and full brightness on dark.
+  Radius:  panels rounded-xl (16px) · controls rounded-lg (12px) · chips
+           rounded-md (8px) · primary actions pill.
+  Type:    SF Pro / Inter (UI) · SF Mono / Menlo (numbers, ids, paths, code).
+*/
+
+@theme {
+  --color-bg: #f5f5f7;
+  --color-panel: #ffffff;
+  --color-elevated: #f0f0f3;
+  --color-line: #e2e2e7;
+  --color-line-strong: #c9c9ce;
+
+  --color-ink: #1d1d1f;
+  --color-muted: #6e6e73;
+  --color-faint: #8e8e93;
+
+  --color-accent: #0071e3;
+  --color-accent-dim: #0a84ff;
+  --color-accent-ink: #ffffff;
+
+  --color-ok: #1f8a3b;
+  --color-warn: #b45309;
+  --color-err: #d70015;
+  --color-info: #5e5ce6;
+
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Inter Variable", "Helvetica Neue",
+    system-ui, sans-serif;
+  --font-mono: "SF Mono", ui-monospace, Menlo, "Geist Mono Variable", Consolas, monospace;
+
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-2xl: 22px;
+
+  --shadow-card: 0 1px 2px rgb(0 0 0 / 0.04), 0 8px 24px rgb(0 0 0 / 0.05);
+  --shadow-sheet: 0 2px 6px rgb(0 0 0 / 0.08), 0 30px 90px rgb(0 0 0 / 0.22);
+  --shadow-thumb: 0 1px 3px rgb(0 0 0 / 0.14), 0 0 0 0.5px rgb(0 0 0 / 0.04);
+}
+
+/* macOS dark appearance. Only the tokens change; the layout never inverts a
+   section on its own. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #161618;
+    --color-panel: #1e1e21;
+    --color-elevated: #2a2a2e;
+    --color-line: #303035;
+    --color-line-strong: #48484e;
+
+    --color-ink: #f5f5f7;
+    --color-muted: #a1a1a6;
+    --color-faint: #7c7c82;
+
+    --color-accent: #0a84ff;
+    --color-accent-dim: #409cff;
+    --color-accent-ink: #ffffff;
+
+    --color-ok: #30d158;
+    --color-warn: #ff9f0a;
+    --color-err: #ff453a;
+    --color-info: #7d7aff;
+
+    --shadow-card: 0 1px 2px rgb(0 0 0 / 0.3), 0 8px 24px rgb(0 0 0 / 0.35);
+    --shadow-sheet: 0 2px 6px rgb(0 0 0 / 0.4), 0 30px 90px rgb(0 0 0 / 0.6);
+    --shadow-thumb: 0 1px 3px rgb(0 0 0 / 0.5), 0 0 0 0.5px rgb(255 255 255 / 0.06);
+  }
+}
+
+@layer base {
+  * {
+    border-color: var(--color-line);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-bg);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    font-feature-settings: "cv11", "ss01", "calt";
+    letter-spacing: -0.005em;
+  }
+
+  h1,
+  h2,
+  h3 {
+    letter-spacing: -0.02em;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--color-accent) 22%, transparent);
+    color: var(--color-ink);
+  }
+
+  /* Overlay scrollbars: thin, no track, only there when you look for them. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--color-ink) 22%, transparent) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--color-ink) 22%, transparent);
+    border-radius: 9999px;
+    border: 3px solid transparent;
+    background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in srgb, var(--color-ink) 36%, transparent);
+    background-clip: padding-box;
+  }
+
+  :focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 25%, transparent);
+    border-radius: var(--radius-md);
+  }
+
+  input[type="range"] {
+    accent-color: var(--color-accent);
+  }
+  input[type="checkbox"] {
+    accent-color: var(--color-accent);
+  }
+
+  kbd {
+    font-family: var(--font-sans);
+    font-size: 10px;
+    font-weight: 500;
+  }
+}
+
+@layer components {
+  /* Frosted material for the sidebar and toolbars — translucent surface with
+     a blur, and a hairline instead of a heavy border. */
+  .glass {
+    background: color-mix(in srgb, var(--color-bg) 78%, transparent);
+    backdrop-filter: saturate(180%) blur(20px);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+  }
+
+  /* Ground for 3D and image stages: a whisper of a grid on the page grey, so a
+     mesh reads against it without the stage looking like a card. */
+  .grid-backdrop {
+    background-color: var(--color-elevated);
+    background-image:
+      radial-gradient(color-mix(in srgb, var(--color-line-strong) 55%, transparent) 1px, transparent 1px);
+    background-size: 22px 22px;
+  }
+
+  .shimmer {
+    background: linear-gradient(
+      100deg,
+      var(--color-elevated) 30%,
+      var(--color-panel) 50%,
+      var(--color-elevated) 70%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.4s ease-in-out infinite;
+  }
+}
+
+@keyframes shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  .shimmer {
+    animation: none;
+  }
+}
