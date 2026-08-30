@@ -12,6 +12,7 @@ import {
 import { extname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { computeBBox, loadSTL } from "../mesh/stl.ts";
+import { renderAOViews } from "../render/ao.ts";
 import { normalizeReference, type ReferenceFormat } from "./normalization.ts";
 
 export type { ReferenceFormat } from "./normalization.ts";
@@ -131,7 +132,19 @@ export class ReferenceAuthority {
     };
   }
 
-  #record(handle: string): PrivateManifest & { canonicalPath: string } {
+  async renderReferenceImage(handle: string): Promise<Uint8Array> {
+    const record = this.#record(handle);
+    const renderDir = join(record.dir, "render");
+    const result = await renderAOViews({
+      stlPath: record.canonicalPath,
+      outDir: renderDir,
+      views: ["isometric"],
+    });
+    if (!result.ok) throw new Error(result.error);
+    return readFileSync(join(renderDir, "ao-isometric.png"));
+  }
+
+  #record(handle: string): PrivateManifest & { dir: string; canonicalPath: string } {
     if (!/^ref_[0-9a-f-]+$/.test(handle)) throw new Error("invalid reference handle");
     const dir = join(this.#root, handle);
     const manifestPath = join(dir, "manifest.json");
@@ -146,6 +159,7 @@ export class ReferenceAuthority {
     }
     return {
       ...(manifest as PrivateManifest),
+      dir,
       canonicalPath: join(dir, "canonical.stl"),
     };
   }
