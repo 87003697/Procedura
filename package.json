@@ -13,6 +13,7 @@
     "setup": "bash scripts/install-deps.sh",
     "typecheck": "tsc --noEmit",
     "procedura": "bun run scripts/procedura.ts",
+    "mesh-to-cad": "bun run scripts/mesh-to-cad.ts",
     "paint": "bun run scripts/paint.ts",
     "motion": "bun run scripts/motion.ts",
     "batch": "bun run scripts/batch.ts",

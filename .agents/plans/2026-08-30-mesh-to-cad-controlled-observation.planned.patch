@@ -1,0 +1,430 @@
+diff --git a/README.md b/README.md
+index 302b779..c7d4401 100644
+--- a/README.md
++++ b/README.md
+@@ -136,6 +136,18 @@ Set `PROCEDURA_REFERENCE_ROOT` to a directory outside the Procedura checkout
+ and outputs root. Studio uses the same setting to display the imported Mesh;
+ the run directory stores only an opaque `reference.json` descriptor.
+ 
++After import is verified, controlled observation can produce a reconstruction
++brief without generating CAD:
++
++```bash
++bun run mesh-to-cad --observe-only --mesh reference.stl \
++  -o outputs/reference-observation
++```
++
++The Observer receives only a bounded summary and fixed isometric/front/right/top
++PNG views. Dimensions and view mappings in `reconstruction-brief.json` are
++written by the host, not accepted from the model.
++
+ That is text-only, part-by-part, with no image API and no Blender in the draft
+ loop, and it is what you get with no flags at all. It is the cheapest useful
+ configuration, not the strongest one.
+diff --git a/prompts/reference_observer_system.md b/prompts/reference_observer_system.md
+new file mode 100644
+index 0000000..42a0f53
+--- /dev/null
++++ b/prompts/reference_observer_system.md
+@@ -0,0 +1,18 @@
++You are the reference observer for a mesh geometry reconstruction brief.
++
++The trusted host has inspected the private source through a bounded Reference
++Authority. You receive only an opaque handle, a summary, and four fixed-camera
++PNGs. You cannot request or infer a path, raw mesh, vertices, faces, samples,
++ray casts, arbitrary cameras, slices, or exports.
++
++Return only one JSON object with this exact shape:
++{
++  "objectSummary": "short description",
++  "parts": [{"name": "snake_case", "description": "visible geometry"}],
++  "features": ["visible feature"],
++  "symmetry": ["observed symmetry or asymmetry"],
++  "geometryObservations": ["ordered visible geometry or structure observation"]
++}
++
++Describe only visible evidence. Do not invent hidden features. Dimensions and
++view-to-artifact mappings are host-owned and added after your response.
+diff --git a/scripts/mesh-to-cad.ts b/scripts/mesh-to-cad.ts
+index 8bbf4a5..224def0 100755
+--- a/scripts/mesh-to-cad.ts
++++ b/scripts/mesh-to-cad.ts
+@@ -1,6 +1,8 @@
+ #!/usr/bin/env bun
+ 
+-import { importReferenceRun } from "../src/pipeline/mesh-to-cad-reference.ts";
++import { readFileSync } from "node:fs";
++
++import { importReferenceRun, observeReferenceRun } from "../src/pipeline/mesh-to-cad-reference.ts";
+ 
+ interface Args {
+   outputDir: string;
+@@ -8,7 +10,11 @@ interface Args {
+   referenceHandle?: string;
+   referenceRoot?: string;
+   runsRoot?: string;
++  prompt?: string;
++  promptFile?: string;
++  observerModel?: string;
+   importOnly: boolean;
++  observeOnly: boolean;
+ }
+ 
+ function help(): never {
+@@ -21,17 +27,21 @@ Usage:
+ 
+ Options:
+   --import-only               import/reuse a reference without LLM or CAD generation
++  --observe-only              create controlled renders and a reconstruction brief
+   --mesh PATH                 import a CAD Z-up STL or OBJ
+   --reference-handle HANDLE   reuse an existing opaque handle
+   --reference-root PATH       private store root (or PROCEDURA_REFERENCE_ROOT)
+   --runs-root PATH            Studio runs root (or PROCEDURA_OUTPUTS_ROOT)
++  --prompt TEXT               optional reconstruction intent
++  --prompt-file PATH          read intent from UTF-8 text
++  --observer-model MODEL      model used by the controlled Observer
+   -o, --output PATH           output run directory
+ `);
+   process.exit(0);
+ }
+ 
+ function parse(argv: string[]): Args {
+-  const args: Args = { outputDir: "", importOnly: false };
++  const args: Args = { outputDir: "", importOnly: false, observeOnly: false };
+   for (let i = 0; i < argv.length; i++) {
+     const value = argv[i]!;
+     if (value === "-o" || value === "--output") args.outputDir = argv[++i]!;
+@@ -39,11 +49,17 @@ function parse(argv: string[]): Args {
+     else if (value === "--reference-handle") args.referenceHandle = argv[++i]!;
+     else if (value === "--reference-root") args.referenceRoot = argv[++i]!;
+     else if (value === "--runs-root") args.runsRoot = argv[++i]!;
++    else if (value === "--prompt") args.prompt = argv[++i]!;
++    else if (value === "--prompt-file") args.promptFile = argv[++i]!;
++    else if (value === "--observer-model") args.observerModel = argv[++i]!;
+     else if (value === "--import-only") args.importOnly = true;
++    else if (value === "--observe-only") args.observeOnly = true;
+     else if (value === "-h" || value === "--help") help();
+     else throw new Error(`unknown flag: ${value}`);
+   }
+-  if (!args.importOnly) throw new Error("Plan 1 requires --import-only");
++  if (args.importOnly === args.observeOnly) {
++    throw new Error("pass exactly one of --import-only or --observe-only");
++  }
+   if (!args.outputDir) throw new Error("-o/--output is required");
+   if (Boolean(args.meshPath) === Boolean(args.referenceHandle)) {
+     throw new Error("pass exactly one of --mesh or --reference-handle");
+@@ -52,13 +68,22 @@ function parse(argv: string[]): Args {
+ }
+ 
+ const args = parse(process.argv.slice(2));
+-const result = importReferenceRun({
++const common = {
+   outputDir: args.outputDir,
+   ...(args.meshPath ? { meshPath: args.meshPath } : {}),
+   ...(args.referenceHandle ? { referenceHandle: args.referenceHandle } : {}),
+   ...(args.referenceRoot ? { referenceRoot: args.referenceRoot } : {}),
+   ...(args.runsRoot ? { runsRoot: args.runsRoot } : {}),
+-});
++};
++const text = args.prompt ?? (args.promptFile ? readFileSync(args.promptFile, "utf8").trim() : undefined);
++const result = args.importOnly
++  ? importReferenceRun(common)
++  : await observeReferenceRun({
++      ...common,
++      ...(text ? { text } : {}),
++      ...(args.observerModel ? { observerModel: args.observerModel } : {}),
++    });
+ console.log(`reference: ${result.reference.handle}`);
+ console.log(`format: ${result.summary.format}`);
+ console.log(`dimensions: ${result.summary.dimensions.join(" × ")}`);
++if ("observation" in result) console.log(`brief: ${result.observation.briefPath}`);
+diff --git a/src/llm/generate.ts b/src/llm/generate.ts
+index 2c32c54..0043948 100644
+--- a/src/llm/generate.ts
++++ b/src/llm/generate.ts
+@@ -35,6 +35,45 @@ export interface GenerateResult {
+  * attempts² POSTs against a failing gateway.
+  */
+ const client = createLLMClient({ fetch: longTimeoutFetch, maxAttempts: 1 });
++const singleRequestClient = createLLMClient({ fetch, maxAttempts: 1 });
++
++async function singleRequestEvents(
++  route: RouteDef<unknown>,
++  req: CanonicalRequest,
++  signal?: AbortSignal,
++): Promise<import("@harness/template/llm/protocol").LLMEvent[]> {
++  const prepared = await singleRequestClient.prepare(route, req);
++  let response: Response;
++  try {
++    response = await fetch(prepared.url, {
++      method: prepared.method,
++      headers: prepared.headers,
++      body: prepared.body,
++      redirect: "error",
++      ...(signal !== undefined ? { signal } : {}),
++    });
++  } catch (error) {
++    return [{ kind: "error", error: error as Error, recoverable: false }];
++  }
++  if (!response.ok) {
++    const body = await response.text().catch(() => "");
++    return [{
++      kind: "error",
++      error: new Error(`${response.status} ${response.statusText}: ${body}`),
++      recoverable: false,
++    }];
++  }
++  const events: import("@harness/template/llm/protocol").LLMEvent[] = [];
++  try {
++    for await (const raw of route.framing.parse(response.body)) {
++      events.push(...route.protocol.parseEvent(raw));
++      if (route.protocol.isTerminal?.(raw)) break;
++    }
++  } catch (error) {
++    events.push({ kind: "error", error: error as Error, recoverable: false });
++  }
++  return events;
++}
+ 
+ /** Send one turn; collect the text and reasoning deltas. */
+ export async function generateOnce(args: {
+@@ -42,6 +80,7 @@ export async function generateOnce(args: {
+   model: ModelRef;
+   system: string;
+   parts: CanonicalPart[];
++  singleRequest?: boolean;
+   signal?: AbortSignal;
+ }): Promise<GenerateResult> {
+   const req: CanonicalRequest = {
+@@ -51,7 +90,9 @@ export async function generateOnce(args: {
+   };
+   applyAutoCache(req, { protocolId: args.route.protocol.id });
+ 
+-  const events = await client.generate(args.route, req);
++  const events = args.singleRequest
++    ? await singleRequestEvents(args.route, req, args.signal)
++    : await client.generate(args.route, req);
+   let text = "";
+   let reasoning = "";
+   for (const ev of events) {
+diff --git a/src/pipeline/mesh-to-cad-reference.ts b/src/pipeline/mesh-to-cad-reference.ts
+index 1cdbd08..d243497 100644
+--- a/src/pipeline/mesh-to-cad-reference.ts
++++ b/src/pipeline/mesh-to-cad-reference.ts
+@@ -6,6 +6,7 @@ import {
+   type ReferenceDescriptor,
+   type ReferenceSummary,
+ } from "../reference/authority.ts";
++import { observeReference, type ObservationResult } from "../reference/observer.ts";
+ 
+ const PROCEDURA_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..", "..");
+ 
+@@ -23,6 +24,16 @@ export interface ImportReferenceRunResult {
+   summary: ReferenceSummary;
+ }
+ 
++export interface ObserveReferenceRunOpts extends ImportReferenceRunOpts {
++  text?: string;
++  observerModel?: string;
++  signal?: AbortSignal;
++}
++
++export interface ObserveReferenceRunResult extends ImportReferenceRunResult {
++  observation: ObservationResult;
++}
++
+ function isInside(path: string, root: string): boolean {
+   const rel = relative(root, path);
+   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+@@ -53,3 +64,20 @@ export function importReferenceRun(opts: ImportReferenceRunOpts): ImportReferenc
+   }, null, 2), "utf8");
+   return { outputDir, reference, summary };
+ }
++
++export async function observeReferenceRun(opts: ObserveReferenceRunOpts): Promise<ObserveReferenceRunResult> {
++  const imported = importReferenceRun(opts);
++  const runsRoot = resolve(opts.runsRoot ?? process.env["PROCEDURA_OUTPUTS_ROOT"] ?? join(PROCEDURA_ROOT, "outputs"));
++  const configuredRoot = opts.referenceRoot ?? process.env["PROCEDURA_REFERENCE_ROOT"];
++  if (!configuredRoot) throw new Error("Mesh-to-CAD requires --reference-root or PROCEDURA_REFERENCE_ROOT");
++  const authority = new ReferenceAuthority(resolve(configuredRoot), [runsRoot, PROCEDURA_ROOT]);
++  const observation = await observeReference({
++    authority,
++    referenceHandle: imported.reference.handle,
++    outputDir: imported.outputDir,
++    ...(opts.observerModel ? { model: opts.observerModel } : {}),
++    ...(opts.text ? { userPrompt: opts.text } : {}),
++    ...(opts.signal ? { signal: opts.signal } : {}),
++  });
++  return { ...imported, observation };
++}
+diff --git a/src/reference/authority.ts b/src/reference/authority.ts
+index f60a084..1777a3c 100644
+--- a/src/reference/authority.ts
++++ b/src/reference/authority.ts
+@@ -4,8 +4,12 @@ import { extname, isAbsolute, join, relative, resolve } from "node:path";
+ 
+ import { loadOBJ } from "../mesh/obj.ts";
+ import { computeBBox, loadSTL, type STLMesh } from "../mesh/stl.ts";
++import { renderAOViews } from "../render/ao.ts";
++import type { ViewName } from "../render/views.ts";
+ 
+ export type ReferenceFormat = "stl" | "obj";
++export const REFERENCE_VIEWS = ["isometric", "front", "right", "top"] as const satisfies readonly ViewName[];
++export type ReferenceView = (typeof REFERENCE_VIEWS)[number];
+ 
+ interface PrivateManifest {
+   handle: string;
+@@ -30,6 +34,11 @@ export interface ReferenceSource {
+   bytes: Uint8Array;
+ }
+ 
++export interface RenderedReferenceView {
++  view: ReferenceView;
++  png: Uint8Array;
++}
++
+ function formatOf(path: string): ReferenceFormat {
+   const ext = extname(path).toLowerCase();
+   if (ext === ".stl") return "stl";
+@@ -92,17 +101,39 @@ export class ReferenceAuthority {
+     };
+   }
+ 
++  async renderReferenceView(handle: string, view: ReferenceView): Promise<RenderedReferenceView> {
++    if (!(REFERENCE_VIEWS as readonly string[]).includes(view)) {
++      throw new Error(`unsupported reference view: ${view}`);
++    }
++    const reference = this.#record(handle);
++    const renderDir = join(reference.dir, "renders");
++    const pngPath = join(renderDir, `ao-${view}.png`);
++    if (!existsSync(pngPath)) {
++      const result = await renderAOViews({
++        stlPath: reference.sourcePath,
++        outDir: renderDir,
++        views: [view],
++        size: 768,
++        samples: 32,
++        aoSamples: 8,
++        zUp: true,
++      });
++      if (!result.ok) throw new Error(result.error);
++    }
++    return { view, png: readFileSync(pngPath) };
++  }
++
+   readReferenceSource(handle: string): ReferenceSource {
+     const reference = this.#record(handle);
+     return { format: reference.format, bytes: readFileSync(reference.sourcePath) };
+   }
+ 
+-  #record(handle: string): PrivateManifest & { sourcePath: string } {
++  #record(handle: string): PrivateManifest & { dir: string; sourcePath: string } {
+     if (!/^ref_[0-9a-f-]+$/.test(handle)) throw new Error("invalid reference handle");
+     const dir = join(this.#root, handle);
+     const manifestPath = join(dir, "manifest.json");
+     if (!existsSync(manifestPath)) throw new Error(`reference not found: ${handle}`);
+     const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as PrivateManifest;
+-    return { ...manifest, sourcePath: join(dir, manifest.sourceFile) };
++    return { ...manifest, dir, sourcePath: join(dir, manifest.sourceFile) };
+   }
+ }
+diff --git a/src/reference/observer.ts b/src/reference/observer.ts
+new file mode 100644
+index 0000000..2cf2c1a
+--- /dev/null
++++ b/src/reference/observer.ts
+@@ -0,0 +1,94 @@
++import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
++import { dirname, join, resolve } from "node:path";
++
++import type { CanonicalPart } from "@harness/template/llm/protocol";
++import { z } from "zod";
++
++import { resolveModel } from "../config/models.ts";
++import { generateOnce } from "../llm/generate.ts";
++import { routeForModel } from "../llm/routes.ts";
++import { REFERENCE_VIEWS, ReferenceAuthority, type ReferenceView } from "./authority.ts";
++
++const ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..", "..");
++const SYSTEM = readFileSync(join(ROOT, "prompts", "reference_observer_system.md"), "utf8");
++
++const ObserverDraftSchema = z.object({
++  objectSummary: z.string().min(1),
++  parts: z.array(z.object({ name: z.string().min(1), description: z.string().min(1) })).min(1),
++  features: z.array(z.string().min(1)),
++  symmetry: z.array(z.string().min(1)),
++  geometryObservations: z.array(z.string().min(1)).min(1),
++}).strict();
++
++export interface ReconstructionBrief {
++  objectSummary: string;
++  dimensions: [number, number, number];
++  parts: { name: string; description: string }[];
++  features: string[];
++  symmetry: string[];
++  geometryObservations: string[];
++  views: { view: ReferenceView; artifact: string }[];
++}
++
++export interface ObservationResult {
++  brief: ReconstructionBrief;
++  briefPath: string;
++  renderPaths: string[];
++}
++
++function jsonObject(text: string): unknown {
++  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
++  const source = fenced ?? text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1);
++  return JSON.parse(source);
++}
++
++export async function observeReference(args: {
++  authority: ReferenceAuthority;
++  referenceHandle: string;
++  outputDir: string;
++  model?: string;
++  userPrompt?: string;
++  signal?: AbortSignal;
++}): Promise<ObservationResult> {
++  const outDir = resolve(args.outputDir);
++  const renderDir = join(outDir, "_reference_observer", "renders");
++  mkdirSync(renderDir, { recursive: true });
++  const summary = args.authority.inspectReferenceSummary(args.referenceHandle);
++  const renderPaths: string[] = [];
++  const parts: CanonicalPart[] = [
++    { kind: "text", text: `REFERENCE HANDLE: ${args.referenceHandle}` },
++    { kind: "text", text: `HOST SUMMARY: ${JSON.stringify(summary)}` },
++  ];
++  if (args.userPrompt?.trim()) {
++    parts.push({ kind: "text", text: `USER INTENT: ${args.userPrompt.trim()}` });
++  }
++  for (const view of REFERENCE_VIEWS) {
++    const rendered = await args.authority.renderReferenceView(args.referenceHandle, view);
++    const path = join(renderDir, `ao-${view}.png`);
++    writeFileSync(path, rendered.png);
++    renderPaths.push(path);
++    parts.push({ kind: "text", text: `FIXED VIEW: ${view}` });
++    parts.push({ kind: "image", data: Buffer.from(rendered.png).toString("base64"), mimeType: "image/png" });
++  }
++  const modelKey = args.model ?? "gpt-5.5";
++  const result = await generateOnce({
++    route: routeForModel(modelKey),
++    model: resolveModel(modelKey),
++    system: SYSTEM,
++    parts,
++    singleRequest: true,
++    ...(args.signal ? { signal: args.signal } : {}),
++  });
++  const draft = ObserverDraftSchema.parse(jsonObject(result.text));
++  const brief: ReconstructionBrief = {
++    ...draft,
++    dimensions: summary.dimensions,
++    views: REFERENCE_VIEWS.map((view) => ({
++      view,
++      artifact: `_reference_observer/renders/ao-${view}.png`,
++    })),
++  };
++  const briefPath = join(outDir, "reconstruction-brief.json");
++  writeFileSync(briefPath, JSON.stringify(brief, null, 2), "utf8");
++  return { brief, briefPath, renderPaths };
++}

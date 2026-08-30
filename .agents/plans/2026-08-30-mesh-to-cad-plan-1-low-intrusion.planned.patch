@@ -1,0 +1,1105 @@
+diff --git a/.env.example b/.env.example
+index cceda7d..96c529b 100644
+--- a/.env.example
++++ b/.env.example
+@@ -54,6 +54,10 @@ OPENAI_BASE_URL=https://api.openai.com/v1
+ # Blender, for the AO / parts-colour / PBR renders the critic looks at.
+ # PROCEDURA_BLENDER_PATH=/usr/local/bin/blender
+ 
++# Private source meshes for Mesh-to-CAD. The CLI and Studio must share this
++# directory; run outputs contain only opaque reference handles.
++# PROCEDURA_REFERENCE_ROOT=/absolute/path/outside-procedura-outputs/references
++
+ # NVIDIA Isaac Sim, only for `--motion` physics validation. Defaults to ~/isaacsim.
+ # PROCEDURA_ISAACSIM_PATH=
+ 
+diff --git a/README.md b/README.md
+index 3075176..052b895 100644
+--- a/README.md
++++ b/README.md
+@@ -122,6 +122,26 @@ bun run scripts/procedura.ts -o outputs/daybed \
+   --prompt "a brutalist brass daybed with tapered legs"
+ ```
+ 
++### Mesh reference import and Viewer
++
++Import STL, OBJ, PLY, GLB, glTF, or 3MF into the private reference store
++without calling an LLM or generating CAD. STL, OBJ, and PLY coordinates must
++already be Z-up millimetres; glTF/GLB use standard Y-up metres; 3MF uses its
++declared unit and defined coordinate transform:
++
++```bash
++bun run mesh-to-cad --import-only --mesh reference.stl \
++  -o outputs/reference-import
++```
++
++Set `PROCEDURA_REFERENCE_ROOT` to a directory outside the Procedura checkout
++and outputs root. The import is private and CLI-inspectable; Plan 1 does not
++add a Studio Model tab for a reference-only run. ReferenceViewer appears only
++when a reference descriptor belongs to a run already eligible for the existing
++Model page. Canonical output is geometry-only binary STL in Z-up millimetres;
++STL/OBJ/PLY retain their preconditioned coordinates, while glTF/GLB convert
++Y-up/metres to Z-up/millimetres.
++
+ That is text-only, part-by-part, with no image API and no Blender in the draft
+ loop, and it is what you get with no flags at all. It is the cheapest useful
+ configuration, not the strongest one.
+diff --git a/package.json b/package.json
+index 4bf6224..39aa89c 100644
+--- a/package.json
++++ b/package.json
+@@ -13,6 +13,7 @@
+     "setup": "bash scripts/install-deps.sh",
+     "typecheck": "tsc --noEmit",
+     "procedura": "bun run scripts/procedura.ts",
++    "mesh-to-cad": "bun run scripts/mesh-to-cad.ts",
+     "paint": "bun run scripts/paint.ts",
+     "motion": "bun run scripts/motion.ts",
+     "batch": "bun run scripts/batch.ts",
+diff --git a/web/server.ts b/web/server.ts
+index 94ba2c3..2ea3ea3 100644
+--- a/web/server.ts
++++ b/web/server.ts
+@@ -47,6 +47,8 @@ import type {
+   ServerInfo,
+   UploadResponse,
+ } from "./shared/types.ts";
++import { ReferenceAuthority } from "../src/reference/authority.ts";
++import { referenceMeshHandler } from "./server/reference.ts";
+ 
+ const VERSION = "0.2.0";
+ /** Matches the CLI's own default refine budget. */
+@@ -106,6 +108,10 @@ function rootRiskWarning(): string | null {
+ }
+ 
+ const CHILD_ENV = PROCEDURA_REPO ? parseEnvFile(join(PROCEDURA_REPO, ".env")) : {};
++const REFERENCE_ROOT = process.env["PROCEDURA_REFERENCE_ROOT"] || CHILD_ENV["PROCEDURA_REFERENCE_ROOT"];
++const referenceAuthority = REFERENCE_ROOT
++  ? new ReferenceAuthority(REFERENCE_ROOT, [ROOT, PROCEDURA_REPO ?? resolve(import.meta.dir, "..")])
++  : null;
+ const OPENSCAD = process.env["OPENSCAD_PATH"] || CHILD_ENV["OPENSCAD_PATH"] || "openscad";
+ // Spawned generation jobs inherit CHILD_ENV (parsed from the main repo's .env)
+ // and it overrides process.env in jobs.ts. Pin it to the resolved binary so the
+@@ -582,6 +588,10 @@ function handleFile(req: Request): Response {
+   return new Response(Bun.file(abs), { headers });
+ }
+ 
++function handleReferenceMesh(req: Request): Response {
++  return referenceMeshHandler(referenceAuthority, req);
++}
++
+ // ── serve ────────────────────────────────────────────────────────────────
+ 
+ const server = Bun.serve({
+@@ -595,6 +605,7 @@ const server = Bun.serve({
+     "/api/trajectory": { GET: handleTrajectory },
+     "/api/ls": { GET: handleLs },
+     "/api/file": { GET: handleFile },
++    "/api/reference/mesh": { GET: handleReferenceMesh },
+     "/api/params": { GET: handleParams },
+     "/api/parts": { GET: handleParts },
+     "/api/customize": { POST: handleCustomize },
+diff --git a/web/server/scan.ts b/web/server/scan.ts
+index b987e58..dc98a32 100644
+--- a/web/server/scan.ts
++++ b/web/server/scan.ts
+@@ -161,7 +161,7 @@ function sortViews(a: ViewImage, b: ViewImage): number {
+ 
+ // ── run detection ─────────────────────────────────────────────────────────
+ 
+-const RUN_MARKERS = ["image.png", "draft.scad", "final.scad", "initial.scad"];
++const RUN_MARKERS = ["image.png", "draft.scad", "final.scad", "initial.scad", "reference.json"];
+ 
+ function isRunDir(dir: string): boolean {
+   if (RUN_MARKERS.some((m) => existsSync(join(dir, m)))) return true;
+@@ -825,12 +825,43 @@ export function trajectoryFiles(root: string, dir: string): string[] {
+ 
+ export function readRunDetail(root: string, dir: string): RunDetail {
+   const summary = summarizeRun(root, dir);
++  const referenceRaw = readJson(join(dir, "reference.json"));
++  const summaryRaw = referenceRaw?.["summary"];
++  const summaryRecord = summaryRaw && typeof summaryRaw === "object"
++    ? summaryRaw as Record<string, unknown>
++    : null;
++  const dimensionsRaw = summaryRecord && Array.isArray(summaryRecord["dimensions"])
++    ? summaryRecord["dimensions"]
++    : null;
++  const triangleCount = summaryRecord?.["triangleCount"] ?? null;
++  const validDimensions = dimensionsRaw?.length === 3
++    && dimensionsRaw.every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0);
++  const reference = referenceRaw
++    && typeof referenceRaw["handle"] === "string"
++    && referenceRaw["format"] === "stl"
++    && summaryRecord
++    && summaryRecord["coordinateConvention"] === "Z-up"
++    && summaryRecord["units"] === "mm"
++    && typeof triangleCount === "number" && Number.isFinite(triangleCount) && triangleCount >= 0
++    && validDimensions
++    ? {
++        handle: referenceRaw["handle"],
++        format: "stl" as const,
++        summary: {
++          coordinateConvention: "Z-up" as const,
++          units: "mm" as const,
++          triangleCount,
++          dimensions: [dimensionsRaw[0], dimensionsRaw[1], dimensionsRaw[2]] as [number, number, number],
++        },
++      }
++    : null;
+   return {
+     ...summary,
+     root,
+     dir,
+     prompt: readPrompt(dir),
+     imagePath: existsSync(join(dir, "image.png")) ? rel(root, join(dir, "image.png")) : null,
++    reference,
+     imagePrompt: readText(join(dir, "image_prompt.txt")),
+     finalSummary:
+       readText(join(dir, "final_summary.txt")) ?? readText(join(dir, "ortho_review_summary.txt")),
+diff --git a/web/shared/types.ts b/web/shared/types.ts
+index 51b740b..0c122b4 100644
+--- a/web/shared/types.ts
++++ b/web/shared/types.ts
+@@ -294,6 +294,16 @@ export interface RunDetail extends RunSummary {
+   prompt: string;
+   /** Root-relative path to image.png, or null. */
+   imagePath: string | null;
++  reference: {
++    handle: string;
++    format: "stl";
++    summary: {
++      coordinateConvention: "Z-up";
++      units: "mm";
++      triangleCount: number;
++      dimensions: [number, number, number];
++    };
++  } | null;
+   imagePrompt: string | null;
+   finalSummary: string | null;
+   draftResponse: string | null;
+diff --git a/web/src/components/views/ModelView.tsx b/web/src/components/views/ModelView.tsx
+index a8fc6f1..fe29af6 100644
+--- a/web/src/components/views/ModelView.tsx
++++ b/web/src/components/views/ModelView.tsx
+@@ -6,10 +6,11 @@ import type { MaterialEntry, RunDetail } from "../../../shared/types.ts";
+ import { downloadUrl } from "../../api.ts";
+ import { fade, useMotion } from "../../lib/motion.ts";
+ import { MeshViewer, meshPathOf } from "../MeshViewer.tsx";
++import { ReferenceViewer } from "../ReferenceViewer.tsx";
+ import { ImageView, ViewGallery } from "../images.tsx";
+ import { Chip, Section, Segmented, StatusPill, cx } from "../ui.tsx";
+ 
+-type Mode = "3d" | "painted" | "ao" | "pbr";
++type Mode = "reference" | "3d" | "painted" | "ao" | "pbr";
+ 
+ /**
+  * The deliverable, full-bleed, with one control: which face of it to look at.
+@@ -20,10 +21,11 @@ export function ModelView({ run }: { run: RunDetail }) {
+   const painted = meshPathOf(run.painted);
+   const hasAo = run.previewViews.length > 0;
+   const hasPbr = run.previewPainted.length > 0;
+-  const [mode, setMode] = useState<Mode>(painted ? "painted" : mesh ? "3d" : hasPbr ? "pbr" : "ao");
++  const [mode, setMode] = useState<Mode>(painted ? "painted" : mesh ? "3d" : run.reference ? "reference" : hasPbr ? "pbr" : "ao");
+   const { v } = useMotion();
+ 
+   const modes = [
++    ...(run.reference ? [{ value: "reference" as const, label: "Reference" }] : []),
+     ...(mesh ? [{ value: "3d" as const, label: "3D" }] : []),
+     ...(painted ? [{ value: "painted" as const, label: "Painted" }] : []),
+     ...(hasAo ? [{ value: "ao" as const, label: "Render" }] : []),
+@@ -35,7 +37,9 @@ export function ModelView({ run }: { run: RunDetail }) {
+       <div className="relative min-h-[320px] overflow-hidden rounded-2xl bg-elevated">
+         <AnimatePresence mode="wait" initial={false}>
+           <motion.div key={mode} variants={v(fade)} initial="initial" animate="animate" exit="exit" className="absolute inset-0">
+-            {mode === "painted" && painted ? (
++            {mode === "reference" && run.reference ? (
++              <ReferenceViewer handle={run.reference.handle} className="h-full" />
++            ) : mode === "painted" && painted ? (
+               <MeshViewer path={painted} mtlPath={run.painted?.mtlPath ?? null} className="h-full" />
+             ) : mode === "ao" ? (
+               <ViewGallery views={run.previewViews} alt="final render" className="h-full p-3" />
+diff --git a/scripts/mesh-to-cad.ts b/scripts/mesh-to-cad.ts
+new file mode 100755
+index 0000000..3a584d1
+--- /dev/null
++++ b/scripts/mesh-to-cad.ts
+@@ -0,0 +1,63 @@
++#!/usr/bin/env bun
++
++import { importReferenceRun } from "../src/pipeline/mesh-to-cad-reference.ts";
++
++interface Args {
++  outputDir: string;
++  meshPath?: string;
++  referenceHandle?: string;
++  referenceRoot?: string;
++  runsRoot?: string;
++  importOnly: boolean;
++}
++
++function help(): never {
++  console.log(`
++Mesh-to-CAD Plan 1 — private reference import, Z-up normalization, and local Viewer.
++
++Usage:
++  bun run mesh-to-cad --import-only --mesh reference.stl -o outputs/reference-import
++  bun run mesh-to-cad --import-only --reference-handle HANDLE -o outputs/reference-import
++
++Options:
++  --import-only               import/reuse a reference without LLM or CAD generation
++  --mesh PATH                 import STL, OBJ, PLY, GLB, glTF, or 3MF
++  --reference-handle HANDLE   reuse an existing opaque handle
++  --reference-root PATH       private store root (or PROCEDURA_REFERENCE_ROOT)
++  --runs-root PATH            Studio runs root (or PROCEDURA_OUTPUTS_ROOT)
++  -o, --output PATH           output run directory
++`);
++  process.exit(0);
++}
++
++function parse(argv: string[]): Args {
++  const args: Args = { outputDir: "", importOnly: false };
++  for (let i = 0; i < argv.length; i++) {
++    const value = argv[i]!;
++    if (value === "-o" || value === "--output") args.outputDir = argv[++i]!;
++    else if (value === "--mesh") args.meshPath = argv[++i]!;
++    else if (value === "--reference-handle") args.referenceHandle = argv[++i]!;
++    else if (value === "--reference-root") args.referenceRoot = argv[++i]!;
++    else if (value === "--runs-root") args.runsRoot = argv[++i]!;
++    else if (value === "--import-only") args.importOnly = true;
++    else if (value === "-h" || value === "--help") help();
++    else throw new Error(`unknown flag: ${value}`);
++  }
++  if (!args.importOnly) throw new Error("Plan 1 requires --import-only");
++  if (!args.outputDir) throw new Error("-o/--output is required");
++  if (Boolean(args.meshPath) === Boolean(args.referenceHandle)) {
++    throw new Error("pass exactly one of --mesh or --reference-handle");
++  }
++  return args;
++}
++
++const args = parse(process.argv.slice(2));
++const result = await importReferenceRun({
++  outputDir: args.outputDir,
++  ...(args.meshPath ? { meshPath: args.meshPath } : {}),
++  ...(args.referenceHandle ? { referenceHandle: args.referenceHandle } : {}),
++  ...(args.referenceRoot ? { referenceRoot: args.referenceRoot } : {}),
++  ...(args.runsRoot ? { runsRoot: args.runsRoot } : {}),
++});
++console.log(`reference: ${result.reference.handle}`);
++console.log(`dimensions: ${result.summary.dimensions.join(" × ")} ${result.summary.units}`);
+diff --git a/scripts/_normalize_reference_blender.py b/scripts/_normalize_reference_blender.py
+new file mode 100644
+index 0000000..1f11ca2
+--- /dev/null
++++ b/scripts/_normalize_reference_blender.py
+@@ -0,0 +1,390 @@
++#!/usr/bin/env python3
++"""Convert one supported reference mesh to Procedura's Z-up millimetre STL."""
++
++from __future__ import annotations
++
++import argparse
++import io
++import json
++import math
++import os
++from pathlib import Path
++import struct
++import sys
++import tempfile
++from urllib.parse import unquote, urlparse
++import xml.etree.ElementTree as ET
++import zipfile
++
++import bpy
++
++
++Point = tuple[float, float, float]
++Triangle = tuple[Point, Point, Point]
++Matrix = tuple[tuple[float, float, float, float], ...]
++
++IDENTITY: Matrix = (
++    (1.0, 0.0, 0.0, 0.0),
++    (0.0, 1.0, 0.0, 0.0),
++    (0.0, 0.0, 1.0, 0.0),
++    (0.0, 0.0, 0.0, 1.0),
++)
++
++
++def write_binary_stl(path: Path, triangles: list[Triangle]) -> None:
++    if not triangles:
++        raise ValueError("reference mesh contains no triangles")
++    with path.open("wb") as output:
++        output.write(b"procedura canonical STL".ljust(80, b" "))
++        output.write(struct.pack("<I", len(triangles)))
++        for a, b, c in triangles:
++            ux, uy, uz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
++            vx, vy, vz = c[0] - a[0], c[1] - a[1], c[2] - a[2]
++            nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
++            length = math.sqrt(nx * nx + ny * ny + nz * nz)
++            normal = (0.0, 0.0, 0.0) if length == 0 else (nx / length, ny / length, nz / length)
++            output.write(struct.pack("<12fH", *normal, *a, *b, *c, 0))
++
++
++def gltf_document(path: Path) -> dict[str, object]:
++    if path.suffix.lower() == ".gltf":
++        return json.loads(path.read_text("utf8"))
++    data = path.read_bytes()
++    if len(data) < 20 or data[:4] != b"glTF" or struct.unpack_from("<I", data, 4)[0] != 2:
++        raise ValueError("GLB must use glTF 2.0")
++    offset = 12
++    while offset + 8 <= len(data):
++        size, kind = struct.unpack_from("<II", data, offset)
++        offset += 8
++        chunk = data[offset:offset + size]
++        offset += size
++        if kind == 0x4E4F534A:
++            return json.loads(chunk.rstrip(b"\x00 \t\r\n").decode("utf8"))
++    raise ValueError("GLB has no JSON chunk")
++
++
++def rewrite_gltf_identity(path: Path) -> Path:
++    """Give every source mesh a short unique importer identity.
++
++    Blender's display names are not a stable source-index mapping: they may be
++    truncated or suffixed when names collide. The temporary document keeps all
++    source buffers and rewrites only mesh names to bounded unique identities.
++    """
++    data = path.read_bytes()
++    if path.suffix.lower() == ".gltf":
++        document = json.loads(data.decode("utf8"))
++        chunks: list[tuple[int, bytes]] = []
++    else:
++        if len(data) < 20 or data[:4] != b"glTF":
++            raise ValueError("GLB must use glTF 2.0")
++        document = gltf_document(path)
++        chunks = []
++        offset = 12
++        while offset + 8 <= len(data):
++            size, kind = struct.unpack_from("<II", data, offset)
++            offset += 8
++            chunks.append((kind, data[offset:offset + size]))
++            offset += size
++    meshes = document.get("meshes", [])
++    for index, mesh in enumerate(meshes):
++        identity = f"__procedura_mesh_{index:08d}"
++        mesh["name"] = identity
++    temp_fd, temp_name = tempfile.mkstemp(
++        suffix=path.suffix,
++        prefix=".procedura-gltf-",
++    )
++    try:
++        os.close(temp_fd)
++    except Exception:
++        Path(temp_name).unlink(missing_ok=True)
++        raise
++    temp = Path(temp_name)
++    try:
++        for collection_name in ("buffers", "images"):
++            for resource in document.get(collection_name, []):
++                uri = resource.get("uri")
++                if (
++                    not isinstance(uri, str)
++                    or uri.startswith("data:")
++                    or urlparse(uri).scheme
++                    or Path(unquote(uri)).is_absolute()
++                ):
++                    continue
++                resource["uri"] = str((path.parent / unquote(uri)).resolve())
++        encoded = json.dumps(document, separators=(",", ":")).encode("utf8")
++        if path.suffix.lower() == ".gltf":
++            temp.write_bytes(encoded)
++        else:
++            encoded += b" " * (-len(encoded) % 4)
++            binary = next((chunk for kind, chunk in chunks if kind == 0x004E4942), b"")
++            binary += b"\0" * (-len(binary) % 4)
++            blob = b"glTF" + struct.pack("<II", 2, 12 + 8 + len(encoded) + 8 + len(binary))
++            blob += struct.pack("<II", len(encoded), 0x4E4F534A) + encoded
++            blob += struct.pack("<II", len(binary), 0x004E4942) + binary
++            temp.write_bytes(blob)
++    except Exception:
++        temp.unlink(missing_ok=True)
++        raise
++    return temp
++
++
++def validate_gltf(path: Path) -> set[int]:
++    document = gltf_document(path)
++    scenes = document.get("scenes", [])
++    nodes = document.get("nodes", [])
++    meshes = document.get("meshes", [])
++    scene_index = document.get("scene", 0)
++    if not isinstance(scene_index, int) or scene_index < 0 or scene_index >= len(scenes):
++        raise ValueError("glTF default scene index is out of range")
++    roots = scenes[scene_index].get("nodes", [])
++    reachable: set[int] = set()
++    visiting: set[int] = set()
++
++    def visit(node_index: object) -> None:
++        if not isinstance(node_index, int) or node_index < 0 or node_index >= len(nodes):
++            raise ValueError("glTF default scene node index is out of range")
++        if node_index in visiting:
++            raise ValueError("glTF default scene contains a node cycle")
++        if node_index in reachable:
++            return
++        visiting.add(node_index)
++        node = nodes[node_index]
++        mesh_index = node.get("mesh")
++        if mesh_index is not None and (not isinstance(mesh_index, int) or mesh_index < 0 or mesh_index >= len(meshes)):
++            raise ValueError("glTF default scene mesh index is out of range")
++        for child in node.get("children", []):
++            visit(child)
++        visiting.remove(node_index)
++        reachable.add(node_index)
++
++    for root in roots:
++        visit(root)
++    reachable_meshes = {nodes[index]["mesh"] for index in reachable if "mesh" in nodes[index]}
++    for mesh_index in reachable_meshes:
++        mesh = meshes[mesh_index]
++        for primitive in mesh.get("primitives", []):
++            extensions = primitive.get("extensions", {})
++            if "KHR_draco_mesh_compression" in extensions:
++                raise ValueError("compressed glTF geometry is not supported")
++            if primitive.get("mode", 4) != 4:
++                raise ValueError("glTF primitive mode must be TRIANGLES")
++            if primitive.get("targets"):
++                raise ValueError("glTF morph targets are not supported")
++            accessor_refs = list(primitive.get("attributes", {}).values())
++            if "indices" in primitive:
++                accessor_refs.append(primitive["indices"])
++            accessors = document.get("accessors", [])
++            buffer_views = document.get("bufferViews", [])
++            for accessor_index in accessor_refs:
++                if not isinstance(accessor_index, int) or accessor_index < 0 or accessor_index >= len(accessors):
++                    raise ValueError("glTF default scene accessor index is out of range")
++                buffer_view_index = accessors[accessor_index].get("bufferView")
++                if buffer_view_index is None:
++                    continue
++                if not isinstance(buffer_view_index, int) or buffer_view_index < 0 or buffer_view_index >= len(buffer_views):
++                    raise ValueError("glTF default scene bufferView index is out of range")
++                buffer_extensions = buffer_views[buffer_view_index].get("extensions", {})
++                if "EXT_meshopt_compression" in buffer_extensions:
++                    raise ValueError("compressed glTF geometry is not supported")
++    reachable_skins = {nodes[index]["skin"] for index in reachable if "skin" in nodes[index]}
++    for skin_index in reachable_skins:
++        if not isinstance(skin_index, int) or skin_index < 0 or skin_index >= len(document.get("skins", [])):
++            raise ValueError("glTF default scene skin index is out of range")
++        raise ValueError("glTF skinning is not supported")
++    for animation in document.get("animations", []):
++        for channel in animation.get("channels", []):
++            target = channel.get("target", {})
++            if target.get("node") in reachable:
++                raise ValueError("glTF animation is not supported")
++    return {int(index) for index in reachable_meshes}
++
++
++def blender_triangles(scale: float, allowed_meshes: set[str] | None = None) -> list[Triangle]:
++    triangles: list[Triangle] = []
++    depsgraph = bpy.context.evaluated_depsgraph_get()
++    for instance in depsgraph.object_instances:
++        obj = instance.object
++        if obj.type != "MESH":
++            continue
++        if allowed_meshes is not None and not any(
++            obj.data.name == name or obj.data.name.startswith(name + ".")
++            for name in allowed_meshes
++        ):
++            continue
++        evaluated = obj.evaluated_get(depsgraph)
++        mesh = evaluated.to_mesh()
++        try:
++            mesh.calc_loop_triangles()
++            world = instance.matrix_world
++            for triangle in mesh.loop_triangles:
++                points = []
++                for index in triangle.vertices:
++                    point = world @ mesh.vertices[index].co
++                    points.append((point.x * scale, point.y * scale, point.z * scale))
++                triangles.append((points[0], points[1], points[2]))
++        finally:
++            evaluated.to_mesh_clear()
++    return triangles
++
++
++def convert_with_blender(source: Path, format_name: str) -> list[Triangle]:
++    bpy.ops.wm.read_factory_settings(use_empty=True)
++    if format_name == "ply":
++        bpy.ops.wm.ply_import(filepath=str(source))
++        return blender_triangles(1.0)
++    allowed_indices = validate_gltf(source)
++    importer_source = rewrite_gltf_identity(source)
++    allowed_meshes = {
++        f"__procedura_mesh_{index:08d}" for index in allowed_indices
++    }
++    try:
++        bpy.ops.import_scene.gltf(filepath=str(importer_source), import_pack_images=False)
++    finally:
++        importer_source.unlink(missing_ok=True)
++    for obj in list(bpy.data.objects):
++        if obj.type == "MESH" and not any(
++            obj.data.name == name or obj.data.name.startswith(name + ".")
++            for name in allowed_meshes
++        ):
++            bpy.data.objects.remove(obj, do_unlink=True)
++    bpy.context.view_layer.update()
++    return blender_triangles(1000.0, allowed_meshes)
++
++
++def matrix_from_3mf(raw: str | None) -> Matrix:
++    if raw is None:
++        return IDENTITY
++    values = [float(value) for value in raw.split()]
++    if len(values) != 12:
++        raise ValueError("3MF transform must contain 12 numbers")
++    a, b, c, d, e, f, g, h, i, j, k, l = values
++    return ((a, d, g, j), (b, e, h, k), (c, f, i, l), (0.0, 0.0, 0.0, 1.0))
++
++
++def multiply(left: Matrix, right: Matrix) -> Matrix:
++    return tuple(
++        tuple(sum(left[row][step] * right[step][column] for step in range(4)) for column in range(4))
++        for row in range(4)
++    )
++
++
++def transform_point(matrix: Matrix, point: Point, scale: float) -> Point:
++    x, y, z = point
++    return (
++        (matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z + matrix[0][3]) * scale,
++        (matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z + matrix[1][3]) * scale,
++        (matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z + matrix[2][3]) * scale,
++    )
++
++
++def local_name(tag: str) -> str:
++    return tag.rsplit("}", 1)[-1]
++
++
++def convert_3mf(source: Path) -> list[Triangle]:
++    with zipfile.ZipFile(source) as archive:
++        model_names = []
++        rels_name = "_rels/.rels"
++        if rels_name in archive.namelist():
++            rels = ET.fromstring(archive.read(rels_name))
++            for relation in rels:
++                if relation.attrib.get("Type", "").lower().endswith("/3dmodel"):
++                    target = relation.attrib.get("Target", "").lstrip("/")
++                    if target in archive.namelist():
++                        model_names.append(target)
++        if not model_names:
++            model_names = [name for name in archive.namelist() if name.lower().startswith("3d/") and name.lower().endswith(".model")]
++        if not model_names:
++            raise ValueError("3MF archive has no core model")
++        if len(set(model_names)) != 1:
++            raise ValueError("3MF package must identify exactly one core model")
++        model_data = archive.read(model_names[0])
++    namespace_declarations = {
++        prefix: uri for _, (prefix, uri) in ET.iterparse(io.BytesIO(model_data), events=("start-ns",))
++    }
++    root = ET.fromstring(model_data)
++    required_namespaces: set[str] = set()
++    for prefix in root.attrib.get("requiredextensions", "").split():
++        namespace = namespace_declarations.get(prefix)
++        if namespace is None:
++            raise ValueError(f"3MF required extension prefix is not declared: {prefix}")
++        required_namespaces.add(namespace)
++    unit_scale = {
++        "micron": 0.001,
++        "millimeter": 1.0,
++        "centimeter": 10.0,
++        "meter": 1000.0,
++        "inch": 25.4,
++        "foot": 304.8,
++    }.get(root.attrib.get("unit", "millimeter"))
++    if unit_scale is None:
++        raise ValueError("unsupported 3MF unit")
++    namespace = root.tag.split("}", 1)[0].lstrip("{")
++    query = {"m": namespace}
++    resources = root.find("m:resources", query)
++    build = root.find("m:build", query)
++    if resources is None or build is None or not list(build):
++        raise ValueError("3MF requires resources and build items")
++    objects = {element.attrib["id"]: element for element in resources.findall("m:object", query)}
++    output: list[Triangle] = []
++
++    def reject_required_extension(element: ET.Element) -> None:
++        for current in element.iter():
++            if current.tag.startswith("{") and current.tag.split("}", 1)[0][1:] in required_namespaces:
++                raise ValueError("3MF required extensions are not supported")
++            if any(key.startswith("{") and key.split("}", 1)[0][1:] in required_namespaces for key in current.attrib):
++                raise ValueError("3MF required extensions are not supported")
++
++    def emit(object_id: str, matrix: Matrix, active: set[str]) -> None:
++        if object_id in active:
++            raise ValueError("3MF component cycle")
++        element = objects.get(object_id)
++        if element is None:
++            raise ValueError(f"3MF object not found: {object_id}")
++        reject_required_extension(element)
++        if any(local_name(child.tag) in {"beamlattice", "beam", "balls", "ball"} for child in element.iter()):
++            raise ValueError("3MF beam or lattice geometry is not supported")
++        mesh = element.find("m:mesh", query)
++        components = element.find("m:components", query)
++        if mesh is not None:
++            vertices_element = mesh.find("m:vertices", query)
++            triangles_element = mesh.find("m:triangles", query)
++            if vertices_element is None or triangles_element is None:
++                raise ValueError("3MF mesh requires vertices and triangles")
++            vertices = [
++                (float(vertex.attrib["x"]), float(vertex.attrib["y"]), float(vertex.attrib["z"]))
++                for vertex in vertices_element.findall("m:vertex", query)
++            ]
++            for triangle in triangles_element.findall("m:triangle", query):
++                indices = [int(triangle.attrib[name]) for name in ("v1", "v2", "v3")]
++                output.append(tuple(transform_point(matrix, vertices[index], unit_scale) for index in indices))
++            return
++        if components is None:
++            raise ValueError(f"3MF object has no mesh or components: {object_id}")
++        next_active = active | {object_id}
++        for component in components.findall("m:component", query):
++            child = matrix_from_3mf(component.attrib.get("transform"))
++            emit(component.attrib["objectid"], multiply(matrix, child), next_active)
++
++    reject_required_extension(build)
++    for item in build.findall("m:item", query):
++        emit(item.attrib["objectid"], matrix_from_3mf(item.attrib.get("transform")), set())
++    return output
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--input", required=True, type=Path)
++    parser.add_argument("--format", required=True, choices=("ply", "glb", "gltf", "3mf"))
++    parser.add_argument("--output", required=True, type=Path)
++    args = parser.parse_args(sys.argv[sys.argv.index("--") + 1:])
++    triangles = convert_3mf(args.input) if args.format == "3mf" else convert_with_blender(args.input, args.format)
++    write_binary_stl(args.output, triangles)
++
++
++if __name__ == "__main__":
++    try:
++        main()
++    except Exception as error:
++        print(str(error), file=sys.stderr)
++        raise SystemExit(2)
+diff --git a/src/pipeline/mesh-to-cad-reference.ts b/src/pipeline/mesh-to-cad-reference.ts
+new file mode 100644
+index 0000000..b50369c
+--- /dev/null
++++ b/src/pipeline/mesh-to-cad-reference.ts
+@@ -0,0 +1,86 @@
++import {
++  existsSync,
++  mkdirSync,
++  mkdtempSync,
++  renameSync,
++  rmSync,
++  statSync,
++  writeFileSync,
++} from "node:fs";
++import { dirname, isAbsolute, join, relative, resolve } from "node:path";
++import { randomUUID } from "node:crypto";
++
++import {
++  ReferenceAuthority,
++  type ReferenceDescriptor,
++  type ReferenceSummary,
++} from "../reference/authority.ts";
++
++const PROCEDURA_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..", "..");
++
++export interface ImportReferenceRunOpts {
++  outputDir: string;
++  meshPath?: string;
++  referenceHandle?: string;
++  referenceRoot?: string;
++  runsRoot?: string;
++}
++
++export interface ImportReferenceRunResult {
++  outputDir: string;
++  reference: ReferenceDescriptor;
++  summary: ReferenceSummary;
++}
++
++function isInside(path: string, root: string): boolean {
++  const rel = relative(root, path);
++  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
++}
++
++export async function importReferenceRun(opts: ImportReferenceRunOpts): Promise<ImportReferenceRunResult> {
++  if (Boolean(opts.meshPath) === Boolean(opts.referenceHandle)) {
++    throw new Error("importReferenceRun requires exactly one of meshPath or referenceHandle");
++  }
++  const outputDir = resolve(opts.outputDir);
++  if (existsSync(outputDir) && !statSync(outputDir).isDirectory()) {
++    throw new Error("outputDir must be a directory");
++  }
++  const runsRoot = resolve(opts.runsRoot ?? process.env["PROCEDURA_OUTPUTS_ROOT"] ?? join(PROCEDURA_ROOT, "outputs"));
++  if (!isInside(outputDir, runsRoot)) throw new Error("outputDir must be inside runsRoot");
++  const configuredRoot = opts.referenceRoot ?? process.env["PROCEDURA_REFERENCE_ROOT"];
++  if (!configuredRoot) throw new Error("Mesh-to-CAD requires --reference-root or PROCEDURA_REFERENCE_ROOT");
++  const authority = new ReferenceAuthority(resolve(configuredRoot), [runsRoot, PROCEDURA_ROOT]);
++  let created = false;
++  let createdHandle: string | null = null;
++  const outputExisted = existsSync(outputDir);
++  if (!outputExisted) mkdirSync(dirname(outputDir), { recursive: true });
++  const stagingDir = outputExisted
++    ? outputDir
++    : mkdtempSync(join(dirname(outputDir), "." + randomUUID() + ".reference-import-"));
++  const descriptorPath = outputExisted
++    ? join(outputDir, ".reference-" + randomUUID() + ".json")
++    : join(stagingDir, "reference.json");
++  try {
++    const reference = opts.meshPath
++      ? await authority.importReference(opts.meshPath)
++      : { handle: opts.referenceHandle! };
++    created = Boolean(opts.meshPath);
++    createdHandle = created ? reference.handle : null;
++    const summary = authority.inspectReferenceSummary(reference.handle);
++    if (!outputExisted) mkdirSync(stagingDir, { recursive: true });
++    writeFileSync(descriptorPath, JSON.stringify({
++      schemaVersion: 1,
++      handle: reference.handle,
++      format: "stl",
++      summary,
++    }, null, 2), "utf8");
++    if (!outputExisted) renameSync(stagingDir, outputDir);
++    else renameSync(descriptorPath, join(outputDir, "reference.json"));
++    return { outputDir, reference, summary };
++  } catch (error) {
++    if (createdHandle) authority.discardReference(createdHandle);
++    if (!outputExisted) rmSync(stagingDir, { recursive: true, force: true });
++    else rmSync(descriptorPath, { force: true });
++    throw error;
++  }
++}
+diff --git a/src/reference/authority.ts b/src/reference/authority.ts
+new file mode 100644
+index 0000000..5d78a4b
+--- /dev/null
++++ b/src/reference/authority.ts
+@@ -0,0 +1,152 @@
++import { randomUUID } from "node:crypto";
++import {
++  copyFileSync,
++  existsSync,
++  mkdirSync,
++  mkdtempSync,
++  readFileSync,
++  renameSync,
++  rmSync,
++  writeFileSync,
++} from "node:fs";
++import { extname, isAbsolute, join, relative, resolve } from "node:path";
++
++import { computeBBox, loadSTL } from "../mesh/stl.ts";
++import { normalizeReference, type ReferenceFormat } from "./normalization.ts";
++
++export type { ReferenceFormat } from "./normalization.ts";
++
++interface PrivateManifest {
++  schemaVersion: 2;
++  handle: string;
++  originalFormat: ReferenceFormat;
++  sourceFile: string;
++  canonicalFile: "canonical.stl";
++}
++
++export interface ReferenceDescriptor {
++  handle: string;
++}
++
++export interface ReferenceSummary {
++  coordinateConvention: "Z-up";
++  units: "mm";
++  triangleCount: number;
++  dimensions: [number, number, number];
++}
++
++export interface ReferenceViewerMesh {
++  format: "stl";
++  bytes: ArrayBuffer;
++}
++
++export function formatOf(path: string): ReferenceFormat {
++  const ext = extname(path).toLowerCase();
++  if (ext === ".stl") return "stl";
++  if (ext === ".obj") return "obj";
++  if (ext === ".ply") return "ply";
++  if (ext === ".glb") return "glb";
++  if (ext === ".gltf") return "gltf";
++  if (ext === ".3mf") return "3mf";
++  throw new Error("reference mesh must be STL, OBJ, PLY, GLB, glTF, or 3MF");
++}
++
++function isInside(path: string, root: string): boolean {
++  const rel = relative(root, path);
++  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
++}
++
++export class ReferenceAuthority {
++  readonly #root: string;
++
++  constructor(root: string, forbiddenRoots: readonly string[]) {
++    const privateRoot = resolve(root);
++    for (const forbidden of forbiddenRoots.map((value) => resolve(value))) {
++      if (isInside(privateRoot, forbidden) || isInside(forbidden, privateRoot)) {
++        throw new Error("reference root must be disjoint from runs and workspace roots");
++      }
++    }
++    this.#root = privateRoot;
++  }
++
++  async importReference(sourcePath: string): Promise<ReferenceDescriptor> {
++    const source = resolve(sourcePath);
++    if (!existsSync(source)) throw new Error("reference mesh not found: " + source);
++    const format = formatOf(source);
++    mkdirSync(this.#root, { recursive: true });
++    const staging = mkdtempSync(join(this.#root, ".import-"));
++
++    try {
++      const canonical = join(staging, "canonical.stl");
++      await normalizeReference(source, format, canonical);
++      const mesh = loadSTL(canonical);
++      const dimensions = computeBBox(mesh).size;
++      if (mesh.triCount === 0 || !dimensions.every(Number.isFinite)) {
++        throw new Error("reference geometry is not measurable");
++      }
++      const handle = "ref_" + randomUUID();
++      const sourceFile = "source." + format;
++      copyFileSync(source, join(staging, sourceFile));
++      const manifest: PrivateManifest = {
++        schemaVersion: 2,
++        handle,
++        originalFormat: format,
++        sourceFile,
++        canonicalFile: "canonical.stl",
++      };
++      writeFileSync(join(staging, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
++      renameSync(staging, join(this.#root, handle));
++      return { handle };
++    } catch (error) {
++      rmSync(staging, { recursive: true, force: true });
++      throw error;
++    }
++  }
++
++  discardReference(handle: string): void {
++    if (!/^ref_[0-9a-f-]+$/.test(handle)) throw new Error("invalid reference handle");
++    rmSync(join(this.#root, handle), { recursive: true, force: true });
++  }
++
++  inspectReferenceSummary(handle: string): ReferenceSummary {
++    const record = this.#record(handle);
++    const mesh = loadSTL(record.canonicalPath);
++    const dimensions = computeBBox(mesh).size;
++    if (mesh.triCount === 0 || !dimensions.every(Number.isFinite)) {
++      throw new Error("reference geometry is not measurable");
++    }
++    return {
++      coordinateConvention: "Z-up",
++      units: "mm",
++      triangleCount: mesh.triCount,
++      dimensions,
++    };
++  }
++
++  readReferenceViewerMesh(handle: string): ReferenceViewerMesh {
++    const bytes = readFileSync(this.#record(handle).canonicalPath);
++    return {
++      format: "stl",
++      bytes: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
++    };
++  }
++
++  #record(handle: string): PrivateManifest & { canonicalPath: string } {
++    if (!/^ref_[0-9a-f-]+$/.test(handle)) throw new Error("invalid reference handle");
++    const dir = join(this.#root, handle);
++    const manifestPath = join(dir, "manifest.json");
++    if (!existsSync(manifestPath)) throw new Error("reference not found: " + handle);
++    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Partial<PrivateManifest>;
++    if (
++      manifest.schemaVersion !== 2 ||
++      manifest.canonicalFile !== "canonical.stl" ||
++      typeof manifest.originalFormat !== "string"
++    ) {
++      throw new Error("reference handle uses unsupported schema; re-import required");
++    }
++    return {
++      ...(manifest as PrivateManifest),
++      canonicalPath: join(dir, "canonical.stl"),
++    };
++  }
++}
+diff --git a/src/reference/normalization.ts b/src/reference/normalization.ts
+new file mode 100644
+index 0000000..6f7f45d
+--- /dev/null
++++ b/src/reference/normalization.ts
+@@ -0,0 +1,53 @@
++import { existsSync } from "node:fs";
++import { spawn } from "node:child_process";
++import { dirname, join, resolve } from "node:path";
++
++import { loadOBJ } from "../mesh/obj.ts";
++import { loadSTL, writeSTL } from "../mesh/stl.ts";
++
++export type ReferenceFormat = "stl" | "obj" | "ply" | "glb" | "gltf" | "3mf";
++
++function blenderBin(): string {
++  const configured = process.env["PROCEDURA_BLENDER_PATH"];
++  if (configured && existsSync(configured)) return configured;
++  for (const candidate of [
++    join(process.env["HOME"] ?? "", "opt", "blender", "blender"),
++    "/Applications/Blender.app/Contents/MacOS/Blender",
++    "/usr/local/bin/blender",
++    "/opt/blender/blender",
++  ]) {
++    if (existsSync(candidate)) return candidate;
++  }
++  const path = Bun.which("blender");
++  if (path) return path;
++  throw new Error("Blender is required to normalize PLY, glTF, GLB, or 3MF");
++}
++
++export async function normalizeReference(
++  source: string,
++  format: ReferenceFormat,
++  output: string,
++): Promise<void> {
++  if (format === "stl" || format === "obj") {
++    const mesh = format === "stl" ? loadSTL(source) : loadOBJ(source);
++    if (mesh.triCount === 0) throw new Error("reference mesh contains no triangles");
++    writeSTL(output, mesh);
++    return;
++  }
++
++  const script = resolve(dirname(new URL(import.meta.url).pathname), "../../scripts/_normalize_reference_blender.py");
++  await new Promise<void>((resolvePromise, reject) => {
++    const child = spawn(
++      blenderBin(),
++      ["-b", "--factory-startup", "--python", script, "--", "--input", source, "--format", format, "--output", output],
++      { stdio: ["ignore", "ignore", "pipe"] },
++    );
++    let stderr = "";
++    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
++    child.on("error", reject);
++    child.on("exit", (code) => {
++      if (code === 0) resolvePromise();
++      else reject(new Error(stderr.trim() || "Blender normalization failed (" + code + ")"));
++    });
++  });
++}
+diff --git a/web/server/reference.ts b/web/server/reference.ts
+new file mode 100644
+index 0000000..85cb317
+--- /dev/null
++++ b/web/server/reference.ts
+@@ -0,0 +1,30 @@
++import type { ReferenceAuthority } from "../../src/reference/authority.ts";
++
++function errorResponse(message: string, status: number): Response {
++  return new Response(JSON.stringify({ error: message }), {
++    status,
++    headers: { "content-type": "application/json; charset=utf-8" },
++  });
++}
++
++export function referenceMeshHandler(
++  authority: ReferenceAuthority | null,
++  request: Request,
++): Response {
++  const handle = new URL(request.url).searchParams.get("handle");
++  if (!handle) return errorResponse("missing ?handle", 400);
++
++  if (!authority) return errorResponse("PROCEDURA_REFERENCE_ROOT is not configured", 503);
++
++  try {
++    const mesh = authority.readReferenceViewerMesh(handle);
++    return new Response(mesh.bytes, {
++      headers: {
++        "content-type": "application/octet-stream",
++        "cache-control": "private, max-age=60",
++      },
++    });
++  } catch (error) {
++    return errorResponse((error as Error).message, 404);
++  }
++}
+diff --git a/web/src/components/ReferenceViewer.tsx b/web/src/components/ReferenceViewer.tsx
+new file mode 100644
+index 0000000..af91362
+--- /dev/null
++++ b/web/src/components/ReferenceViewer.tsx
+@@ -0,0 +1,69 @@
++import { useEffect, useMemo, useState } from "react";
++import { Canvas } from "@react-three/fiber";
++import { Bounds, OrbitControls } from "@react-three/drei";
++import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
++import * as THREE from "three";
++
++import { ErrorState, Spinner } from "./ui.tsx";
++
++function CanonicalMesh({ handle }: { handle: string }) {
++  const [geometry, setGeometry] = useState<THREE.BufferGeometry | null>(null);
++  const [error, setError] = useState<string | null>(null);
++  const material = useMemo(
++    () => new THREE.MeshStandardMaterial({
++      color: "#b4bac2",
++      roughness: 0.58,
++      metalness: 0.08,
++      flatShading: true,
++      side: THREE.DoubleSide,
++    }),
++    [],
++  );
++
++  useEffect(() => () => material.dispose(), [material]);
++  useEffect(() => {
++    const controller = new AbortController();
++    setGeometry((current) => {
++      current?.dispose();
++      return null;
++    });
++    setError(null);
++    fetch("/api/reference/mesh?handle=" + encodeURIComponent(handle), { signal: controller.signal })
++      .then((response) => {
++        if (!response.ok) throw new Error(response.status + " " + response.statusText);
++        return response.arrayBuffer();
++      })
++      .then((bytes) => {
++        const next = new STLLoader().parse(bytes);
++        next.rotateX(-Math.PI / 2);
++        next.computeBoundingBox();
++        const center = next.boundingBox?.getCenter(new THREE.Vector3());
++        if (center) next.translate(-center.x, -center.y, -center.z);
++        next.computeVertexNormals();
++        setGeometry(next);
++      })
++      .catch((cause: unknown) => {
++        if ((cause as Error).name !== "AbortError") setError((cause as Error).message);
++      });
++    return () => controller.abort();
++  }, [handle]);
++  useEffect(() => () => geometry?.dispose(), [geometry]);
++
++  if (error) return <ErrorState message={error} />;
++  if (!geometry) return <Spinner />;
++  return (
++    <Canvas camera={{ position: [60, 45, 60], fov: 40, near: 0.01, far: 100000 }} className="h-full w-full">
++      <color attach="background" args={["#eef0f3"]} />
++      <ambientLight intensity={1.4} />
++      <directionalLight position={[3, 4, 5]} intensity={2} />
++      <Bounds fit clip observe margin={1.2}>
++        <mesh geometry={geometry} material={material} />
++      </Bounds>
++      <OrbitControls makeDefault />
++    </Canvas>
++  );
++}
++
++export function ReferenceViewer({ handle, className }: { handle: string; className?: string }) {
++  return <div className={className}><CanonicalMesh key={handle} handle={handle} /></div>;
++}

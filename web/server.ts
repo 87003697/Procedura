@@ -47,6 +47,8 @@ import type {
   ServerInfo,
   UploadResponse,
 } from "./shared/types.ts";
+import { ReferenceAuthority } from "../src/reference/authority.ts";
+import { referenceMeshHandler } from "./server/reference.ts";
 
 const VERSION = "0.2.0";
 /** Matches the CLI's own default refine budget. */
@@ -106,6 +108,10 @@ function rootRiskWarning(): string | null {
 }
 
 const CHILD_ENV = PROCEDURA_REPO ? parseEnvFile(join(PROCEDURA_REPO, ".env")) : {};
+const REFERENCE_ROOT = process.env["PROCEDURA_REFERENCE_ROOT"] || CHILD_ENV["PROCEDURA_REFERENCE_ROOT"];
+const referenceAuthority = REFERENCE_ROOT
+  ? new ReferenceAuthority(REFERENCE_ROOT, [ROOT, PROCEDURA_REPO ?? resolve(import.meta.dir, "..")])
+  : null;
 const OPENSCAD = process.env["OPENSCAD_PATH"] || CHILD_ENV["OPENSCAD_PATH"] || "openscad";
 // Spawned generation jobs inherit CHILD_ENV (parsed from the main repo's .env)
 // and it overrides process.env in jobs.ts. Pin it to the resolved binary so the
@@ -582,6 +588,10 @@ function handleFile(req: Request): Response {
   return new Response(Bun.file(abs), { headers });
 }
 
+function handleReferenceMesh(req: Request): Response {
+  return referenceMeshHandler(referenceAuthority, req);
+}
+
 // ── serve ────────────────────────────────────────────────────────────────
 
 const server = Bun.serve({
@@ -595,6 +605,7 @@ const server = Bun.serve({
     "/api/trajectory": { GET: handleTrajectory },
     "/api/ls": { GET: handleLs },
     "/api/file": { GET: handleFile },
+    "/api/reference/mesh": { GET: handleReferenceMesh },
     "/api/params": { GET: handleParams },
     "/api/parts": { GET: handleParts },
     "/api/customize": { POST: handleCustomize },

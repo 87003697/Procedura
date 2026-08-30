@@ -122,6 +122,26 @@ bun run scripts/procedura.ts -o outputs/daybed \
   --prompt "a brutalist brass daybed with tapered legs"
 ```
 
+### Mesh reference import and Viewer
+
+Import STL, OBJ, PLY, GLB, glTF, or 3MF into the private reference store
+without calling an LLM or generating CAD. STL, OBJ, and PLY coordinates must
+already be Z-up millimetres; glTF/GLB use standard Y-up metres; 3MF uses its
+declared unit and defined coordinate transform:
+
+```bash
+bun run mesh-to-cad --import-only --mesh reference.stl \
+  -o outputs/reference-import
+```
+
+Set `PROCEDURA_REFERENCE_ROOT` to a directory outside the Procedura checkout
+and outputs root. The import is private and CLI-inspectable; Plan 1 does not
+add a Studio Model tab for a reference-only run. ReferenceViewer appears only
+when a reference descriptor belongs to a run already eligible for the existing
+Model page. Canonical output is geometry-only binary STL in Z-up millimetres;
+STL/OBJ/PLY retain their preconditioned coordinates, while glTF/GLB convert
+Y-up/metres to Z-up/millimetres.
+
 That is text-only, part-by-part, with no image API and no Blender in the draft
 loop, and it is what you get with no flags at all. It is the cheapest useful
 configuration, not the strongest one.

@@ -1,0 +1,226 @@
+diff --git a/README.md b/README.md
+index c7d4401..2179fef 100644
+--- a/README.md
++++ b/README.md
+@@ -148,6 +148,18 @@ The Observer receives only a bounded summary and fixed isometric/front/right/top
+ PNG views. Dimensions and view mappings in `reconstruction-brief.json` are
+ written by the host, not accepted from the model.
+ 
++After both earlier stages are accepted, omit the diagnostic mode flags to feed
++the validated brief and four controlled views into the existing incremental
++draft and produce editable SCAD/OBJ:
++
++```bash
++bun run mesh-to-cad --mesh reference.stl -o outputs/reference-cad \
++  --prompt "reconstruct the visible mechanical object faithfully"
++```
++
++This first generation slice is open-loop: it does not compare, score, refine,
++or repair the generated geometry against the private reference.
++
+ That is text-only, part-by-part, with no image API and no Blender in the draft
+ loop, and it is what you get with no flags at all. It is the cheapest useful
+ configuration, not the strongest one.
+diff --git a/scripts/mesh-to-cad.ts b/scripts/mesh-to-cad.ts
+index 224def0..8e191a8 100755
+--- a/scripts/mesh-to-cad.ts
++++ b/scripts/mesh-to-cad.ts
+@@ -3,6 +3,7 @@
+ import { readFileSync } from "node:fs";
+ 
+ import { importReferenceRun, observeReferenceRun } from "../src/pipeline/mesh-to-cad-reference.ts";
++import { runMeshToCad } from "../src/pipeline/mesh-to-cad.ts";
+ 
+ interface Args {
+   outputDir: string;
+@@ -13,6 +14,7 @@ interface Args {
+   prompt?: string;
+   promptFile?: string;
+   observerModel?: string;
++  scadModel?: string;
+   importOnly: boolean;
+   observeOnly: boolean;
+ }
+@@ -35,6 +37,7 @@ Options:
+   --prompt TEXT               optional reconstruction intent
+   --prompt-file PATH          read intent from UTF-8 text
+   --observer-model MODEL      model used by the controlled Observer
++  --scad-model MODEL          model used by the existing incremental draft
+   -o, --output PATH           output run directory
+ `);
+   process.exit(0);
+@@ -52,14 +55,13 @@ function parse(argv: string[]): Args {
+     else if (value === "--prompt") args.prompt = argv[++i]!;
+     else if (value === "--prompt-file") args.promptFile = argv[++i]!;
+     else if (value === "--observer-model") args.observerModel = argv[++i]!;
++    else if (value === "--scad-model") args.scadModel = argv[++i]!;
+     else if (value === "--import-only") args.importOnly = true;
+     else if (value === "--observe-only") args.observeOnly = true;
+     else if (value === "-h" || value === "--help") help();
+     else throw new Error(`unknown flag: ${value}`);
+   }
+-  if (args.importOnly === args.observeOnly) {
+-    throw new Error("pass exactly one of --import-only or --observe-only");
+-  }
++  if (args.importOnly && args.observeOnly) throw new Error("--import-only conflicts with --observe-only");
+   if (!args.outputDir) throw new Error("-o/--output is required");
+   if (Boolean(args.meshPath) === Boolean(args.referenceHandle)) {
+     throw new Error("pass exactly one of --mesh or --reference-handle");
+@@ -78,12 +80,20 @@ const common = {
+ const text = args.prompt ?? (args.promptFile ? readFileSync(args.promptFile, "utf8").trim() : undefined);
+ const result = args.importOnly
+   ? importReferenceRun(common)
+-  : await observeReferenceRun({
++  : args.observeOnly
++    ? await observeReferenceRun({
++        ...common,
++        ...(text ? { text } : {}),
++        ...(args.observerModel ? { observerModel: args.observerModel } : {}),
++      })
++    : await runMeshToCad({
+       ...common,
+       ...(text ? { text } : {}),
+       ...(args.observerModel ? { observerModel: args.observerModel } : {}),
++      ...(args.scadModel ? { scadModel: args.scadModel } : {}),
+     });
+ console.log(`reference: ${result.reference.handle}`);
+ console.log(`format: ${result.summary.format}`);
+ console.log(`dimensions: ${result.summary.dimensions.join(" × ")}`);
+ if ("observation" in result) console.log(`brief: ${result.observation.briefPath}`);
++if ("generation" in result) console.log(`model: ${result.outputDir}/final.obj`);
+diff --git a/src/pipeline/draft-incremental.ts b/src/pipeline/draft-incremental.ts
+index 906d0be..204570c 100644
+--- a/src/pipeline/draft-incremental.ts
++++ b/src/pipeline/draft-incremental.ts
+@@ -397,6 +397,9 @@ export interface IncrementalDraftOpts {
+   /** When set, skip image-gen and use this image file as the reference (copied
+    * to <outputDir>/image.png). Mirrors runDraft's `inputImage`. */
+   inputImage?: string;
++  /** Ordered host-provided reference images. The first becomes image.png and
++   * the rest image_refN.png; all are attached to plan and per-part calls. */
++  inputImages?: string[];
+   /**
+    * Text-only mode: generate from the prompt with NO reference image at all.
+    *
+@@ -2173,6 +2176,14 @@ export async function runIncrementalDraft(
+   // Text-only and a supplied input image are contradictory; the explicit flag
+   // wins and says so, rather than silently using the image it was told to skip.
+   const textOnly = opts.textOnly ?? false;
++  if (opts.inputImage && opts.inputImages) {
++    throw new Error("runIncrementalDraft: pass inputImage or inputImages, not both");
++  }
++  const suppliedImages = (opts.inputImages ?? (opts.inputImage ? [opts.inputImage] : []))
++    .map((image) => resolve(image));
++  if (textOnly && suppliedImages.length > 0) {
++    throw new Error("runIncrementalDraft: textOnly conflicts with supplied reference images");
++  }
+   const feedbackRenderSize = Number(process.env["PROCEDURA_FEEDBACK_RENDER_SIZE"] ?? "1024");
+   const CONTEXT_VIEWS = resolveContextViews(opts.contextRenders ?? false);
+   // Assembly-aware incremental mode (Slice 1: mating-feature library + prompt).
+@@ -2282,8 +2293,8 @@ export async function runIncrementalDraft(
+       // here would look identical to a failed image-gen in the log.
+       log(`[inc-draft] TEXT-ONLY — no reference image will be generated or used`);
+       emit("draft.image.skipped", { source: "text-only", bytes: 0 });
+-    } else if (opts.inputImage) {
+-      const src = resolve(opts.inputImage);
++    } else if (suppliedImages[0]) {
++      const src = suppliedImages[0];
+       if (!existsSync(src)) throw new Error(`inputImage not found: ${src}`);
+       log(`[inc-draft] image-gen SKIPPED — using provided image ${src}`);
+       if (resolve(imagePath) !== src) copyFileSync(src, imagePath);
+@@ -2318,9 +2329,16 @@ export async function runIncrementalDraft(
+     const refImages: { label: string; b64: string }[] = textOnly ? [] : [
+       { label: "primary", b64: loadImageBase64(imagePath, refImageSize) },
+     ];
++    for (let k = 1; k < suppliedImages.length; k++) {
++      const src = suppliedImages[k]!;
++      if (!existsSync(src)) throw new Error(`inputImage not found: ${src}`);
++      const refPath = join(outDir, `image_ref${k + 1}.png`);
++      if (resolve(refPath) !== src) copyFileSync(src, refPath);
++      refImages.push({ label: `provided view ${k + 1}`, b64: loadImageBase64(refPath, refImageSize) });
++    }
+     for (let k = 0; k < extraRefs; k++) {
+       if (opts.signal?.aborted) break;
+-      const refPath = join(outDir, `image_ref${k + 2}.png`);
++      const refPath = join(outDir, `image_ref${suppliedImages.length + k + 1}.png`);
+       const viewPhrase = EXTRA_REF_VIEWS[k % EXTRA_REF_VIEWS.length]!;
+       try {
+         log(`[inc-draft] multi-ref: generating extra ref ${k + 2} — ${viewPhrase}`);
+diff --git a/src/pipeline/mesh-to-cad.ts b/src/pipeline/mesh-to-cad.ts
+new file mode 100644
+index 0000000..2773394
+--- /dev/null
++++ b/src/pipeline/mesh-to-cad.ts
+@@ -0,0 +1,38 @@
++import {
++  observeReferenceRun,
++  type ObserveReferenceRunOpts,
++  type ObserveReferenceRunResult,
++} from "./mesh-to-cad-reference.ts";
++import { runProcedura, type RunProceduraResult } from "./procedura.ts";
++import type { ReconstructionBrief } from "../reference/observer.ts";
++
++export interface RunMeshToCadOpts extends ObserveReferenceRunOpts {
++  scadModel?: string;
++}
++
++export interface RunMeshToCadResult extends ObserveReferenceRunResult {
++  generation: RunProceduraResult;
++}
++
++function generationText(userText: string | undefined, brief: ReconstructionBrief): string {
++  return [
++    userText?.trim() || "Reconstruct this mesh faithfully as editable parametric CAD.",
++    "The trusted reference observer produced this measured reconstruction brief:",
++    JSON.stringify(brief, null, 2),
++    "Use the measured dimensions. Model only features supported by the brief and attached reference views.",
++  ].join("\n\n");
++}
++
++export async function runMeshToCad(opts: RunMeshToCadOpts): Promise<RunMeshToCadResult> {
++  const observed = await observeReferenceRun(opts);
++  const generation = await runProcedura({
++    outputDir: observed.outputDir,
++    text: generationText(opts.text, observed.observation.brief),
++    inputImages: observed.observation.renderPaths,
++    incremental: true,
++    refine: false,
++    ...(opts.scadModel ? { scadModel: opts.scadModel } : {}),
++    ...(opts.signal ? { signal: opts.signal } : {}),
++  });
++  return { ...observed, generation };
++}
+diff --git a/src/pipeline/procedura.ts b/src/pipeline/procedura.ts
+index ee3060c..6a3aee7 100644
+--- a/src/pipeline/procedura.ts
++++ b/src/pipeline/procedura.ts
+@@ -51,6 +51,8 @@ export interface RunProceduraOpts {
+   /** When set, skip image-gen in the draft phase and use this image file as
+    *  the reference (copied to <outputDir>/image.png). SCAD-gen still runs. */
+   inputImage?: string;
++  /** Multiple host-provided reference views, incremental draft only. */
++  inputImages?: string[];
+   /** Text-only: generate with NO reference image at all. Skips image-gen in the
+    *  draft; refine and paint follow automatically by detecting the absent
+    *  image.png. Incremental draft only — `runDraft` still needs an image. */
+@@ -293,6 +295,7 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
+           ...(opts.scadModel !== undefined ? { scadModel: opts.scadModel } : {}),
+           ...(opts.imageModel !== undefined ? { imageModel: opts.imageModel } : {}),
+           ...(opts.inputImage !== undefined ? { inputImage: opts.inputImage } : {}),
++          ...(opts.inputImages !== undefined ? { inputImages: opts.inputImages } : {}),
+           ...(opts.textOnly ? { textOnly: true } : {}),
+           ...(opts.contextRenders ? { contextRenders: true } : {}),
+           ...(opts.extraRefs !== undefined ? { extraRefs: opts.extraRefs } : {}),
+diff --git a/web/src/components/views/ModelView.tsx b/web/src/components/views/ModelView.tsx
+index 4e0743a..05ed92c 100644
+--- a/web/src/components/views/ModelView.tsx
++++ b/web/src/components/views/ModelView.tsx
+@@ -25,7 +25,7 @@ export function ModelView({ run }: { run: RunDetail }) {
+ 
+   const modes = [
+     ...(run.reference ? [{ value: "reference" as const, label: "Reference" }] : []),
+-    ...(mesh ? [{ value: "3d" as const, label: "3D" }] : []),
++    ...(mesh ? [{ value: "3d" as const, label: run.reference ? "Generated" : "3D" }] : []),
+     ...(painted ? [{ value: "painted" as const, label: "Painted" }] : []),
+     ...(hasAo ? [{ value: "ao" as const, label: "Render" }] : []),
+     ...(hasPbr ? [{ value: "pbr" as const, label: "PBR" }] : []),

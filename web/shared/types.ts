@@ -294,6 +294,16 @@ export interface RunDetail extends RunSummary {
   prompt: string;
   /** Root-relative path to image.png, or null. */
   imagePath: string | null;
+  reference: {
+    handle: string;
+    format: "stl";
+    summary: {
+      coordinateConvention: "Z-up";
+      units: "mm";
+      triangleCount: number;
+      dimensions: [number, number, number];
+    };
+  } | null;
   imagePrompt: string | null;
   finalSummary: string | null;
   draftResponse: string | null;

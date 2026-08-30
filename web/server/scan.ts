@@ -161,7 +161,7 @@ function sortViews(a: ViewImage, b: ViewImage): number {
 
 // ── run detection ─────────────────────────────────────────────────────────
 
-const RUN_MARKERS = ["image.png", "draft.scad", "final.scad", "initial.scad"];
+const RUN_MARKERS = ["image.png", "draft.scad", "final.scad", "initial.scad", "reference.json"];
 
 function isRunDir(dir: string): boolean {
   if (RUN_MARKERS.some((m) => existsSync(join(dir, m)))) return true;
@@ -825,12 +825,45 @@ export function trajectoryFiles(root: string, dir: string): string[] {
 
 export function readRunDetail(root: string, dir: string): RunDetail {
   const summary = summarizeRun(root, dir);
+  const referenceRaw = readJson(join(dir, "reference.json"));
+  const summaryRaw = referenceRaw?.["summary"];
+  const summaryRecord = summaryRaw && typeof summaryRaw === "object"
+    ? summaryRaw as Record<string, unknown>
+    : null;
+  const dimensionsRaw = summaryRecord && Array.isArray(summaryRecord["dimensions"])
+    ? summaryRecord["dimensions"]
+    : null;
+  const triangleCount = summaryRecord?.["triangleCount"];
+  const validDimensions = dimensionsRaw?.length === 3
+    && dimensionsRaw.every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0);
+  const reference = referenceRaw
+    && typeof referenceRaw["handle"] === "string"
+    && referenceRaw["format"] === "stl"
+    && summaryRecord
+    && summaryRecord["coordinateConvention"] === "Z-up"
+    && summaryRecord["units"] === "mm"
+    && typeof triangleCount === "number"
+    && Number.isFinite(triangleCount)
+    && triangleCount >= 0
+    && validDimensions
+    ? {
+        handle: referenceRaw["handle"],
+        format: "stl" as const,
+        summary: {
+          coordinateConvention: "Z-up" as const,
+          units: "mm" as const,
+          triangleCount,
+          dimensions: [dimensionsRaw[0], dimensionsRaw[1], dimensionsRaw[2]] as [number, number, number],
+        },
+      }
+    : null;
   return {
     ...summary,
     root,
     dir,
     prompt: readPrompt(dir),
     imagePath: existsSync(join(dir, "image.png")) ? rel(root, join(dir, "image.png")) : null,
+    reference,
     imagePrompt: readText(join(dir, "image_prompt.txt")),
     finalSummary:
       readText(join(dir, "final_summary.txt")) ?? readText(join(dir, "ortho_review_summary.txt")),

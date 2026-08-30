@@ -1,0 +1,514 @@
+diff --git a/.env.example b/.env.example
+index cceda7d..96c529b 100644
+--- a/.env.example
++++ b/.env.example
+@@ -54,6 +54,10 @@ OPENAI_BASE_URL=https://api.openai.com/v1
+ # Blender, for the AO / parts-colour / PBR renders the critic looks at.
+ # PROCEDURA_BLENDER_PATH=/usr/local/bin/blender
+ 
++# Private source meshes for Mesh-to-CAD. The CLI and Studio must share this
++# directory; run outputs contain only opaque reference handles.
++# PROCEDURA_REFERENCE_ROOT=/absolute/path/outside-procedura-outputs/references
++
+ # NVIDIA Isaac Sim, only for `--motion` physics validation. Defaults to ~/isaacsim.
+ # PROCEDURA_ISAACSIM_PATH=
+ 
+diff --git a/README.md b/README.md
+index 3075176..302b779 100644
+--- a/README.md
++++ b/README.md
+@@ -122,6 +122,20 @@ bun run scripts/procedura.ts -o outputs/daybed \
+   --prompt "a brutalist brass daybed with tapered legs"
+ ```
+ 
++### Mesh reference import and Viewer
++
++Import a CAD Z-up STL/OBJ into the private reference store without calling an
++LLM or generating CAD:
++
++```bash
++bun run mesh-to-cad --import-only --mesh reference.stl \
++  -o outputs/reference-import
++```
++
++Set `PROCEDURA_REFERENCE_ROOT` to a directory outside the Procedura checkout
++and outputs root. Studio uses the same setting to display the imported Mesh;
++the run directory stores only an opaque `reference.json` descriptor.
++
+ That is text-only, part-by-part, with no image API and no Blender in the draft
+ loop, and it is what you get with no flags at all. It is the cheapest useful
+ configuration, not the strongest one.
+diff --git a/package.json b/package.json
+index 4bf6224..39aa89c 100644
+--- a/package.json
++++ b/package.json
+@@ -13,6 +13,7 @@
+     "setup": "bash scripts/install-deps.sh",
+     "typecheck": "tsc --noEmit",
+     "procedura": "bun run scripts/procedura.ts",
++    "mesh-to-cad": "bun run scripts/mesh-to-cad.ts",
+     "paint": "bun run scripts/paint.ts",
+     "motion": "bun run scripts/motion.ts",
+     "batch": "bun run scripts/batch.ts",
+diff --git a/scripts/mesh-to-cad.ts b/scripts/mesh-to-cad.ts
+new file mode 100755
+index 0000000..8bbf4a5
+--- /dev/null
++++ b/scripts/mesh-to-cad.ts
+@@ -0,0 +1,64 @@
++#!/usr/bin/env bun
++
++import { importReferenceRun } from "../src/pipeline/mesh-to-cad-reference.ts";
++
++interface Args {
++  outputDir: string;
++  meshPath?: string;
++  referenceHandle?: string;
++  referenceRoot?: string;
++  runsRoot?: string;
++  importOnly: boolean;
++}
++
++function help(): never {
++  console.log(`
++Mesh-to-CAD Plan 1 — private reference import and local Viewer.
++
++Usage:
++  bun run mesh-to-cad --import-only --mesh reference.stl -o outputs/reference-import
++  bun run mesh-to-cad --import-only --reference-handle HANDLE -o outputs/reference-import
++
++Options:
++  --import-only               import/reuse a reference without LLM or CAD generation
++  --mesh PATH                 import a CAD Z-up STL or OBJ
++  --reference-handle HANDLE   reuse an existing opaque handle
++  --reference-root PATH       private store root (or PROCEDURA_REFERENCE_ROOT)
++  --runs-root PATH            Studio runs root (or PROCEDURA_OUTPUTS_ROOT)
++  -o, --output PATH           output run directory
++`);
++  process.exit(0);
++}
++
++function parse(argv: string[]): Args {
++  const args: Args = { outputDir: "", importOnly: false };
++  for (let i = 0; i < argv.length; i++) {
++    const value = argv[i]!;
++    if (value === "-o" || value === "--output") args.outputDir = argv[++i]!;
++    else if (value === "--mesh") args.meshPath = argv[++i]!;
++    else if (value === "--reference-handle") args.referenceHandle = argv[++i]!;
++    else if (value === "--reference-root") args.referenceRoot = argv[++i]!;
++    else if (value === "--runs-root") args.runsRoot = argv[++i]!;
++    else if (value === "--import-only") args.importOnly = true;
++    else if (value === "-h" || value === "--help") help();
++    else throw new Error(`unknown flag: ${value}`);
++  }
++  if (!args.importOnly) throw new Error("Plan 1 requires --import-only");
++  if (!args.outputDir) throw new Error("-o/--output is required");
++  if (Boolean(args.meshPath) === Boolean(args.referenceHandle)) {
++    throw new Error("pass exactly one of --mesh or --reference-handle");
++  }
++  return args;
++}
++
++const args = parse(process.argv.slice(2));
++const result = importReferenceRun({
++  outputDir: args.outputDir,
++  ...(args.meshPath ? { meshPath: args.meshPath } : {}),
++  ...(args.referenceHandle ? { referenceHandle: args.referenceHandle } : {}),
++  ...(args.referenceRoot ? { referenceRoot: args.referenceRoot } : {}),
++  ...(args.runsRoot ? { runsRoot: args.runsRoot } : {}),
++});
++console.log(`reference: ${result.reference.handle}`);
++console.log(`format: ${result.summary.format}`);
++console.log(`dimensions: ${result.summary.dimensions.join(" × ")}`);
+diff --git a/src/pipeline/mesh-to-cad-reference.ts b/src/pipeline/mesh-to-cad-reference.ts
+new file mode 100644
+index 0000000..1cdbd08
+--- /dev/null
++++ b/src/pipeline/mesh-to-cad-reference.ts
+@@ -0,0 +1,55 @@
++import { mkdirSync, writeFileSync } from "node:fs";
++import { dirname, isAbsolute, join, relative, resolve } from "node:path";
++
++import {
++  ReferenceAuthority,
++  type ReferenceDescriptor,
++  type ReferenceSummary,
++} from "../reference/authority.ts";
++
++const PROCEDURA_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..", "..");
++
++export interface ImportReferenceRunOpts {
++  outputDir: string;
++  meshPath?: string;
++  referenceHandle?: string;
++  referenceRoot?: string;
++  runsRoot?: string;
++}
++
++export interface ImportReferenceRunResult {
++  outputDir: string;
++  reference: ReferenceDescriptor;
++  summary: ReferenceSummary;
++}
++
++function isInside(path: string, root: string): boolean {
++  const rel = relative(root, path);
++  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
++}
++
++export function importReferenceRun(opts: ImportReferenceRunOpts): ImportReferenceRunResult {
++  if (Boolean(opts.meshPath) === Boolean(opts.referenceHandle)) {
++    throw new Error("importReferenceRun requires exactly one of meshPath or referenceHandle");
++  }
++  const outputDir = resolve(opts.outputDir);
++  const runsRoot = resolve(opts.runsRoot ?? process.env["PROCEDURA_OUTPUTS_ROOT"] ?? join(PROCEDURA_ROOT, "outputs"));
++  if (!isInside(outputDir, runsRoot)) throw new Error("outputDir must be inside runsRoot");
++  const configuredRoot = opts.referenceRoot ?? process.env["PROCEDURA_REFERENCE_ROOT"];
++  if (!configuredRoot) throw new Error("Mesh-to-CAD requires --reference-root or PROCEDURA_REFERENCE_ROOT");
++  const authority = new ReferenceAuthority(resolve(configuredRoot), [runsRoot, PROCEDURA_ROOT]);
++  mkdirSync(outputDir, { recursive: true });
++  const reference = opts.meshPath
++    ? authority.importReference(opts.meshPath)
++    : {
++        handle: opts.referenceHandle!,
++        format: authority.inspectReferenceSummary(opts.referenceHandle!).format,
++      };
++  const summary = authority.inspectReferenceSummary(reference.handle);
++  writeFileSync(join(outputDir, "reference.json"), JSON.stringify({
++    schemaVersion: 1,
++    handle: reference.handle,
++    format: reference.format,
++  }, null, 2), "utf8");
++  return { outputDir, reference, summary };
++}
+diff --git a/src/reference/authority.ts b/src/reference/authority.ts
+new file mode 100644
+index 0000000..f60a084
+--- /dev/null
++++ b/src/reference/authority.ts
+@@ -0,0 +1,108 @@
++import { randomUUID } from "node:crypto";
++import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
++import { extname, isAbsolute, join, relative, resolve } from "node:path";
++
++import { loadOBJ } from "../mesh/obj.ts";
++import { computeBBox, loadSTL, type STLMesh } from "../mesh/stl.ts";
++
++export type ReferenceFormat = "stl" | "obj";
++
++interface PrivateManifest {
++  handle: string;
++  format: ReferenceFormat;
++  sourceFile: string;
++}
++
++export interface ReferenceDescriptor {
++  handle: string;
++  format: ReferenceFormat;
++}
++
++export interface ReferenceSummary {
++  format: ReferenceFormat;
++  coordinateConvention: "Z-up";
++  triangleCount: number;
++  dimensions: [number, number, number];
++}
++
++export interface ReferenceSource {
++  format: ReferenceFormat;
++  bytes: Uint8Array;
++}
++
++function formatOf(path: string): ReferenceFormat {
++  const ext = extname(path).toLowerCase();
++  if (ext === ".stl") return "stl";
++  if (ext === ".obj") return "obj";
++  throw new Error("reference mesh must be STL or OBJ");
++}
++
++function loadMesh(path: string, format: ReferenceFormat): STLMesh {
++  return format === "stl" ? loadSTL(path) : loadOBJ(path);
++}
++
++function isInside(path: string, root: string): boolean {
++  const rel = relative(root, path);
++  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
++}
++
++export class ReferenceAuthority {
++  readonly #root: string;
++
++  constructor(root: string, forbiddenRoots: readonly string[]) {
++    const privateRoot = resolve(root);
++    for (const forbidden of forbiddenRoots.map((value) => resolve(value))) {
++      if (isInside(privateRoot, forbidden) || isInside(forbidden, privateRoot)) {
++        throw new Error("reference root must be disjoint from runs and workspace roots");
++      }
++    }
++    this.#root = privateRoot;
++  }
++
++  importReference(sourcePath: string): ReferenceDescriptor {
++    const source = resolve(sourcePath);
++    if (!existsSync(source)) throw new Error(`reference mesh not found: ${source}`);
++    const format = formatOf(source);
++    const mesh = loadMesh(source, format);
++    const dimensions = computeBBox(mesh).size;
++    if (mesh.triCount === 0) throw new Error("reference mesh contains no triangles");
++    if (!dimensions.every(Number.isFinite)) throw new Error("reference dimensions must be finite");
++    const handle = `ref_${randomUUID()}`;
++    const dir = join(this.#root, handle);
++    const sourceFile = `source.${format}`;
++    mkdirSync(dir, { recursive: true });
++    copyFileSync(source, join(dir, sourceFile));
++    const manifest: PrivateManifest = { handle, format, sourceFile };
++    writeFileSync(join(dir, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
++    return { handle, format };
++  }
++
++  inspectReferenceSummary(handle: string): ReferenceSummary {
++    const reference = this.#record(handle);
++    const mesh = loadMesh(reference.sourcePath, reference.format);
++    const dimensions = computeBBox(mesh).size;
++    if (mesh.triCount === 0 || !dimensions.every(Number.isFinite)) {
++      throw new Error("reference geometry is not measurable");
++    }
++    return {
++      format: reference.format,
++      coordinateConvention: "Z-up",
++      triangleCount: mesh.triCount,
++      dimensions,
++    };
++  }
++
++  readReferenceSource(handle: string): ReferenceSource {
++    const reference = this.#record(handle);
++    return { format: reference.format, bytes: readFileSync(reference.sourcePath) };
++  }
++
++  #record(handle: string): PrivateManifest & { sourcePath: string } {
++    if (!/^ref_[0-9a-f-]+$/.test(handle)) throw new Error("invalid reference handle");
++    const dir = join(this.#root, handle);
++    const manifestPath = join(dir, "manifest.json");
++    if (!existsSync(manifestPath)) throw new Error(`reference not found: ${handle}`);
++    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as PrivateManifest;
++    return { ...manifest, sourcePath: join(dir, manifest.sourceFile) };
++  }
++}
+diff --git a/web/server.ts b/web/server.ts
+index 94ba2c3..2c8eeb3 100644
+--- a/web/server.ts
++++ b/web/server.ts
+@@ -47,6 +47,7 @@ import type {
+   ServerInfo,
+   UploadResponse,
+ } from "./shared/types.ts";
++import { ReferenceAuthority } from "../src/reference/authority.ts";
+ 
+ const VERSION = "0.2.0";
+ /** Matches the CLI's own default refine budget. */
+@@ -106,6 +107,10 @@ function rootRiskWarning(): string | null {
+ }
+ 
+ const CHILD_ENV = PROCEDURA_REPO ? parseEnvFile(join(PROCEDURA_REPO, ".env")) : {};
++const REFERENCE_ROOT = process.env["PROCEDURA_REFERENCE_ROOT"] || CHILD_ENV["PROCEDURA_REFERENCE_ROOT"];
++const referenceAuthority = REFERENCE_ROOT
++  ? new ReferenceAuthority(REFERENCE_ROOT, [ROOT, PROCEDURA_REPO ?? resolve(import.meta.dir, "..")])
++  : null;
+ const OPENSCAD = process.env["OPENSCAD_PATH"] || CHILD_ENV["OPENSCAD_PATH"] || "openscad";
+ // Spawned generation jobs inherit CHILD_ENV (parsed from the main repo's .env)
+ // and it overrides process.env in jobs.ts. Pin it to the resolved binary so the
+@@ -582,6 +587,27 @@ function handleFile(req: Request): Response {
+   return new Response(Bun.file(abs), { headers });
+ }
+ 
++function handleReferenceMesh(req: Request, server: Bun.Server<undefined>): Response {
++  const handle = q(req, "handle");
++  if (!handle) return err("missing ?handle");
++  const address = server.requestIP(req)?.address;
++  if (address !== "127.0.0.1" && address !== "::1" && address !== "::ffff:127.0.0.1") {
++    return err("reference mesh is available only to the local Viewer", 403);
++  }
++  if (!referenceAuthority) return err("PROCEDURA_REFERENCE_ROOT is not configured", 503);
++  try {
++    const reference = referenceAuthority.readReferenceSource(handle);
++    return new Response(reference.bytes, {
++      headers: {
++        "content-type": reference.format === "stl" ? "application/octet-stream" : "text/plain; charset=utf-8",
++        "cache-control": "private, max-age=60",
++      },
++    });
++  } catch (error) {
++    return err((error as Error).message, 404);
++  }
++}
++
+ // ── serve ────────────────────────────────────────────────────────────────
+ 
+ const server = Bun.serve({
+@@ -595,6 +621,7 @@ const server = Bun.serve({
+     "/api/trajectory": { GET: handleTrajectory },
+     "/api/ls": { GET: handleLs },
+     "/api/file": { GET: handleFile },
++    "/api/reference/mesh": { GET: handleReferenceMesh },
+     "/api/params": { GET: handleParams },
+     "/api/parts": { GET: handleParts },
+     "/api/customize": { POST: handleCustomize },
+diff --git a/web/server/scan.ts b/web/server/scan.ts
+index b987e58..23ea29b 100644
+--- a/web/server/scan.ts
++++ b/web/server/scan.ts
+@@ -161,7 +161,7 @@ function sortViews(a: ViewImage, b: ViewImage): number {
+ 
+ // ── run detection ─────────────────────────────────────────────────────────
+ 
+-const RUN_MARKERS = ["image.png", "draft.scad", "final.scad", "initial.scad"];
++const RUN_MARKERS = ["image.png", "draft.scad", "final.scad", "initial.scad", "reference.json"];
+ 
+ function isRunDir(dir: string): boolean {
+   if (RUN_MARKERS.some((m) => existsSync(join(dir, m)))) return true;
+@@ -215,7 +215,7 @@ function detectShape(dir: string): RunShape {
+   if (existsSync(join(dir, "initial.scad")) || existsSync(join(dir, "ortho_reviewed.scad"))) {
+     return "ortho";
+   }
+-  if (existsSync(join(dir, "image.png")) || existsSync(join(dir, "_trajectory"))) {
++  if (existsSync(join(dir, "image.png")) || existsSync(join(dir, "_trajectory")) || existsSync(join(dir, "reference.json"))) {
+     return "sparse";
+   }
+   return "unknown";
+@@ -825,12 +825,19 @@ export function trajectoryFiles(root: string, dir: string): string[] {
+ 
+ export function readRunDetail(root: string, dir: string): RunDetail {
+   const summary = summarizeRun(root, dir);
++  const referenceRaw = readJson(join(dir, "reference.json"));
++  const reference = referenceRaw
++    && typeof referenceRaw["handle"] === "string"
++    && (referenceRaw["format"] === "stl" || referenceRaw["format"] === "obj")
++    ? { handle: String(referenceRaw["handle"]), format: referenceRaw["format"] }
++    : null;
+   return {
+     ...summary,
+     root,
+     dir,
+     prompt: readPrompt(dir),
+     imagePath: existsSync(join(dir, "image.png")) ? rel(root, join(dir, "image.png")) : null,
++    reference,
+     imagePrompt: readText(join(dir, "image_prompt.txt")),
+     finalSummary:
+       readText(join(dir, "final_summary.txt")) ?? readText(join(dir, "ortho_review_summary.txt")),
+diff --git a/web/shared/types.ts b/web/shared/types.ts
+index 51b740b..ed86428 100644
+--- a/web/shared/types.ts
++++ b/web/shared/types.ts
+@@ -294,6 +294,10 @@ export interface RunDetail extends RunSummary {
+   prompt: string;
+   /** Root-relative path to image.png, or null. */
+   imagePath: string | null;
++  reference: {
++    handle: string;
++    format: "stl" | "obj";
++  } | null;
+   imagePrompt: string | null;
+   finalSummary: string | null;
+   draftResponse: string | null;
+diff --git a/web/src/components/MeshViewer.tsx b/web/src/components/MeshViewer.tsx
+index 48bafa8..1045396 100644
+--- a/web/src/components/MeshViewer.tsx
++++ b/web/src/components/MeshViewer.tsx
+@@ -16,6 +16,20 @@ import {
+ import { fileUrl } from "../api.ts";
+ import { cx, ErrorState, Spinner } from "./ui.tsx";
+ 
++function referenceSource(path: string): { format: "stl" | "obj"; handle: string } | null {
++  if (!path.startsWith("reference:")) return null;
++  const [, format, handle] = path.split(":");
++  if ((format !== "stl" && format !== "obj") || !handle) throw new Error("invalid reference source");
++  return { format, handle };
++}
++
++function meshUrl(path: string): string {
++  const reference = referenceSource(path);
++  return reference
++    ? `/api/reference/mesh?handle=${encodeURIComponent(reference.handle)}`
++    : fileUrl(path);
++}
++
+ /** A mid grey reads against the light stage and still shows its facets. */
+ const MODEL_COLOR = "#b4bac2";
+ const MODEL_DIM_COLOR = "#d9dce0";
+@@ -105,13 +119,13 @@ function positionsOnly(geo: THREE.BufferGeometry): THREE.BufferGeometry {
+ }
+ 
+ async function fetchText(path: string, signal: AbortSignal): Promise<string> {
+-  const r = await fetch(fileUrl(path), { signal });
++  const r = await fetch(meshUrl(path), { signal });
+   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+   return r.text();
+ }
+ 
+ async function fetchBuffer(path: string, signal: AbortSignal): Promise<ArrayBuffer> {
+-  const r = await fetch(fileUrl(path), { signal });
++  const r = await fetch(meshUrl(path), { signal });
+   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+   return r.arrayBuffer();
+ }
+@@ -121,7 +135,8 @@ async function fetchBuffer(path: string, signal: AbortSignal): Promise<ArrayBuff
+  *  single geometry. Models are Z-up (OpenSCAD / Blender); three is Y-up. */
+ async function loadModel(path: string, mtlPath: string | null, signal: AbortSignal): Promise<Loaded> {
+   // A `?v=` cache-buster may ride along on live paths; it is not part of the extension.
+-  const ext = path.split("?")[0]!.toLowerCase().split(".").pop();
++  const reference = referenceSource(path);
++  const ext = reference?.format ?? path.split("?")[0]!.toLowerCase().split(".").pop();
+   if (ext === "stl") {
+     const geo = new STLLoader().parse(await fetchBuffer(path, signal));
+     geo.rotateX(-Math.PI / 2);
+diff --git a/web/src/components/RunView.tsx b/web/src/components/RunView.tsx
+index c5be7d5..1eb7e5b 100644
+--- a/web/src/components/RunView.tsx
++++ b/web/src/components/RunView.tsx
+@@ -26,7 +26,7 @@ import { MotionStage } from "./stages/MotionStage.tsx";
+ type ViewId = "model" | "build" | "refine" | "motion" | "code";
+ 
+ const VIEWS: { id: ViewId; label: string; Icon: typeof Cube; available: (r: RunDetail) => boolean }[] = [
+-  { id: "model", label: "Model", Icon: Cube, available: (r) => r.final != null || r.draft != null || r.hasImage },
++  { id: "model", label: "Model", Icon: Cube, available: (r) => r.final != null || r.draft != null || r.hasImage || r.reference != null },
+   { id: "build", label: "Build", Icon: Stack, available: (r) => r.incremental != null },
+   { id: "refine", label: "Refine", Icon: Sparkle, available: (r) => r.cycles.length > 0 || r.refineSteps.length > 0 || r.renderSteps.length > 0 },
+   { id: "motion", label: "Motion", Icon: GearSix, available: (r) => r.motion != null },
+diff --git a/web/src/components/views/ModelView.tsx b/web/src/components/views/ModelView.tsx
+index a8fc6f1..4e0743a 100644
+--- a/web/src/components/views/ModelView.tsx
++++ b/web/src/components/views/ModelView.tsx
+@@ -9,7 +9,7 @@ import { MeshViewer, meshPathOf } from "../MeshViewer.tsx";
+ import { ImageView, ViewGallery } from "../images.tsx";
+ import { Chip, Section, Segmented, StatusPill, cx } from "../ui.tsx";
+ 
+-type Mode = "3d" | "painted" | "ao" | "pbr";
++type Mode = "reference" | "3d" | "painted" | "ao" | "pbr";
+ 
+ /**
+  * The deliverable, full-bleed, with one control: which face of it to look at.
+@@ -20,10 +20,11 @@ export function ModelView({ run }: { run: RunDetail }) {
+   const painted = meshPathOf(run.painted);
+   const hasAo = run.previewViews.length > 0;
+   const hasPbr = run.previewPainted.length > 0;
+-  const [mode, setMode] = useState<Mode>(painted ? "painted" : mesh ? "3d" : hasPbr ? "pbr" : "ao");
++  const [mode, setMode] = useState<Mode>(painted ? "painted" : mesh ? "3d" : run.reference ? "reference" : hasPbr ? "pbr" : "ao");
+   const { v } = useMotion();
+ 
+   const modes = [
++    ...(run.reference ? [{ value: "reference" as const, label: "Reference" }] : []),
+     ...(mesh ? [{ value: "3d" as const, label: "3D" }] : []),
+     ...(painted ? [{ value: "painted" as const, label: "Painted" }] : []),
+     ...(hasAo ? [{ value: "ao" as const, label: "Render" }] : []),
+@@ -35,7 +36,9 @@ export function ModelView({ run }: { run: RunDetail }) {
+       <div className="relative min-h-[320px] overflow-hidden rounded-2xl bg-elevated">
+         <AnimatePresence mode="wait" initial={false}>
+           <motion.div key={mode} variants={v(fade)} initial="initial" animate="animate" exit="exit" className="absolute inset-0">
+-            {mode === "painted" && painted ? (
++            {mode === "reference" && run.reference ? (
++              <MeshViewer path={`reference:${run.reference.format}:${run.reference.handle}`} className="h-full" />
++            ) : mode === "painted" && painted ? (
+               <MeshViewer path={painted} mtlPath={run.painted?.mtlPath ?? null} className="h-full" />
+             ) : mode === "ao" ? (
+               <ViewGallery views={run.previewViews} alt="final render" className="h-full p-3" />

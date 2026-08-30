@@ -6,10 +6,11 @@ import type { MaterialEntry, RunDetail } from "../../../shared/types.ts";
 import { downloadUrl } from "../../api.ts";
 import { fade, useMotion } from "../../lib/motion.ts";
 import { MeshViewer, meshPathOf } from "../MeshViewer.tsx";
+import { ReferenceViewer } from "../ReferenceViewer.tsx";
 import { ImageView, ViewGallery } from "../images.tsx";
 import { Chip, Section, Segmented, StatusPill, cx } from "../ui.tsx";
 
-type Mode = "3d" | "painted" | "ao" | "pbr";
+type Mode = "reference" | "3d" | "painted" | "ao" | "pbr";
 
 /**
  * The deliverable, full-bleed, with one control: which face of it to look at.
@@ -20,10 +21,11 @@ export function ModelView({ run }: { run: RunDetail }) {
   const painted = meshPathOf(run.painted);
   const hasAo = run.previewViews.length > 0;
   const hasPbr = run.previewPainted.length > 0;
-  const [mode, setMode] = useState<Mode>(painted ? "painted" : mesh ? "3d" : hasPbr ? "pbr" : "ao");
+  const [mode, setMode] = useState<Mode>(painted ? "painted" : mesh ? "3d" : run.reference ? "reference" : hasPbr ? "pbr" : "ao");
   const { v } = useMotion();
 
   const modes = [
+    ...(run.reference ? [{ value: "reference" as const, label: "Reference" }] : []),
     ...(mesh ? [{ value: "3d" as const, label: "3D" }] : []),
     ...(painted ? [{ value: "painted" as const, label: "Painted" }] : []),
     ...(hasAo ? [{ value: "ao" as const, label: "Render" }] : []),
@@ -35,7 +37,9 @@ export function ModelView({ run }: { run: RunDetail }) {
       <div className="relative min-h-[320px] overflow-hidden rounded-2xl bg-elevated">
         <AnimatePresence mode="wait" initial={false}>
           <motion.div key={mode} variants={v(fade)} initial="initial" animate="animate" exit="exit" className="absolute inset-0">
-            {mode === "painted" && painted ? (
+            {mode === "reference" && run.reference ? (
+              <ReferenceViewer handle={run.reference.handle} className="h-full" />
+            ) : mode === "painted" && painted ? (
               <MeshViewer path={painted} mtlPath={run.painted?.mtlPath ?? null} className="h-full" />
             ) : mode === "ao" ? (
               <ViewGallery views={run.previewViews} alt="final render" className="h-full p-3" />
