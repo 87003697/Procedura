@@ -237,7 +237,12 @@ async function measureModules(
 // The driver
 // ──────────────────────────────────────────────────────────────────────────
 
-export async function runDirectRefine(opts: RefineOpts): Promise<RefineResult> {
+export interface DirectRefineOpts extends RefineOpts {
+  /** Explicit ordered references supplied by the unified pipeline. */
+  referenceImages?: readonly { label: string; path: string }[];
+}
+
+export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineResult> {
   const workspace = resolveWorkspace(opts.outputDir);
   const state = createSessionState(
     workspace,
@@ -252,19 +257,33 @@ export async function runDirectRefine(opts: RefineOpts): Promise<RefineResult> {
 
   const criticSystem = readFileSync(DIAGNOSE_PROMPT_PATH, "utf8");
   const patchSystem = readFileSync(PATCH_PROMPT_PATH, "utf8");
-  // In a text-only run there is no image.png, so the TARGET the critic compares
-  // renders against is the spec sentence. Both call sites take this block whole,
-  // so neither has to know which mode it is in.
-  const referenceParts: CanonicalPart[] = workspace.hasImage
-    ? [
-        { kind: "text", text: "REFERENCE image (target):" },
-        { kind: "image", data: readFileSync(workspace.imagePath).toString("base64"), mimeType: "image/png" },
-      ]
-    : [{
+  // Both call sites consume this block whole, so the loop does not need to
+  // distinguish multi-view, single-image, and text-only runs.
+  const referenceParts: CanonicalPart[] = [];
+  if (opts.referenceImages?.length) {
+    opts.referenceImages.forEach((image, index) => {
+      referenceParts.push({
+        kind: "text",
+        text: `REFERENCE view ${index + 1} (${image.label}${index === 0 ? ", primary" : ""}):`,
+      });
+      referenceParts.push({
+        kind: "image",
+        data: readFileSync(image.path).toString("base64"),
+        mimeType: "image/png",
+      });
+    });
+  } else if (workspace.hasImage) {
+    referenceParts.push(
+      { kind: "text", text: "REFERENCE image (target):" },
+      { kind: "image", data: readFileSync(workspace.imagePath).toString("base64"), mimeType: "image/png" },
+    );
+  } else {
+    referenceParts.push({
         kind: "text",
         text: "TARGET — there is NO reference image for this object. The text " +
               "specification is the complete and only target:\n\n" + workspace.text,
-      }];
+    });
+  }
 
   const log = (s: string): void => console.log(s);
   log(`\n=== ${opts.bannerLabel ?? "Procedura refine (direct)"} ===`);

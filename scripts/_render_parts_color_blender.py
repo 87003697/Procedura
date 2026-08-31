@@ -151,7 +151,7 @@ def make_colored_material(rgb: tuple[float, float, float],
     metalness = 0.0 if metal is None else max(0.0, min(1.0, metal))
     mat = bpy.data.materials.new(name=f"PartMat_{r:.2f}_{g:.2f}_{b:.2f}")
     mat.use_nodes = True
-    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    bsdf = next(n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED")
     bsdf.inputs["Base Color"].default_value = (r, g, b, 1.0)
     bsdf.inputs["Roughness"].default_value = roughness
     if "Metallic" in bsdf.inputs:

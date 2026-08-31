@@ -23,7 +23,9 @@
  *   { text, outputDir, redo }          — force re-draft even if artifacts exist
  */
 
-import { existsSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
+import {
+  existsSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, readdirSync, rmSync, statSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 
 import { createFileTrajectoryWriter } from "../trajectory/writer.ts";
@@ -51,6 +53,11 @@ export interface RunProceduraOpts {
   /** When set, skip image-gen in the draft phase and use this image file as
    *  the reference (copied to <outputDir>/image.png). SCAD-gen still runs. */
   inputImage?: string;
+  /** Ordered provided views for incremental draft. The first is authoritative.
+   * The same set is reused by direct whole-model refine when enabled. */
+  inputImages?: readonly { label: string; path: string }[];
+  /** Host-produced plan.json for incremental draft; skips internal planning. */
+  inputPlan?: string;
   /** Text-only: generate with NO reference image at all. Skips image-gen in the
    *  draft; refine and paint follow automatically by detecting the absent
    *  image.png. Incremental draft only — `runDraft` still needs an image. */
@@ -112,6 +119,10 @@ export interface RunProceduraOpts {
    * the final model: draft.{scad,stl,obj} are promoted to final.* and a
    * synthetic verdict="skipped" RefineResult is returned (no refine loop). */
   refine?: boolean;
+  /** Select the Phase 2 implementation. Defaults to PROCEDURA_REFINE_MODE, then direct. */
+  refineMode?: "direct" | "agent";
+  /** Promotion profile when refine is disabled. Default preserves normal Procedura artifacts. */
+  draftPromotion?: "standard" | "open-loop";
   /** Persist the binary STL deliverable (draft.stl / final.stl) alongside the
    * OBJ. Default false — only the normalized OBJ (+ SCAD) is exported; STL is
    * kept in internal build dirs for connectivity/rendering. */
@@ -292,9 +303,12 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
           outputDir: outDir,
           ...(opts.scadModel !== undefined ? { scadModel: opts.scadModel } : {}),
           ...(opts.imageModel !== undefined ? { imageModel: opts.imageModel } : {}),
-          ...(opts.inputImage !== undefined
-            ? { inputImages: [{ label: "primary", path: opts.inputImage }] }
-            : {}),
+          ...(opts.inputImages !== undefined
+            ? { inputImages: opts.inputImages }
+            : opts.inputImage !== undefined
+              ? { inputImages: [{ label: "primary", path: opts.inputImage }] }
+              : {}),
+          ...(opts.inputPlan !== undefined ? { inputPlan: opts.inputPlan } : {}),
           ...(opts.textOnly ? { textOnly: true } : {}),
           ...(opts.contextRenders ? { contextRenders: true } : {}),
           ...(opts.extraRefs !== undefined ? { extraRefs: opts.extraRefs } : {}),
@@ -335,16 +349,18 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
     let refineResult: RefineResult;
     if (opts.refine === false) {
       console.log(`\n--- Phase 2: refine SKIPPED (--no-refine) — promoting draft → final ---`);
-      refineResult = await promoteDraftAsFinal(outDir, writer.path, exportStl);
+      refineResult = await promoteDraftAsFinal(
+        outDir, writer.path, exportStl, opts.draftPromotion ?? "standard",
+      );
     } else {
       // Refine implementation. `direct` (the default) runs the fixed
       // context → critic → measure → patch → gate cycle as a pipeline; `agent`
       // is the historical seventeen-tool loop, kept for A/B until the benchmark
       // has ruled on the swap. PROCEDURA_REFINE_MODE=agent restores it.
-      const refineMode = process.env["PROCEDURA_REFINE_MODE"] === "agent" ? "agent" : "direct";
+      const refineMode = opts.refineMode
+        ?? (process.env["PROCEDURA_REFINE_MODE"] === "agent" ? "agent" : "direct");
       console.log(`\n--- Phase 2: refine (${refineMode}) ---`);
-      const refineImpl = refineMode === "agent" ? runRefine : runDirectRefine;
-      refineResult = await refineImpl({
+      const refineOpts = {
         outputDir: outDir,
         ...(opts.agentModel !== undefined ? { model: opts.agentModel } : {}),
         ...(opts.maxSteps !== undefined ? { maxSteps: opts.maxSteps } : {}),
@@ -352,7 +368,13 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
         ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
         trajectorySink: writer.sink,
         trajectoryPathOverride: writer.path,
-      });
+      };
+      refineResult = refineMode === "agent"
+        ? await runRefine(refineOpts)
+        : await runDirectRefine({
+            ...refineOpts,
+            ...(opts.inputImages !== undefined ? { referenceImages: opts.inputImages } : {}),
+          });
     }
 
     // ── Phase 3: paint (opt-in material pass) ─────────────────────────────
@@ -427,7 +449,10 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
  * final_summary.txt, and return a synthetic verdict="skipped" RefineResult. The
  * draft stage already normalized draft.obj, so final.obj is normalized too. */
 async function promoteDraftAsFinal(
-  outDir: string, trajectoryPath: string, exportStl: boolean,
+  outDir: string,
+  trajectoryPath: string,
+  exportStl: boolean,
+  profile: "standard" | "open-loop",
 ): Promise<RefineResult> {
   const copy = (from: string, to: string): boolean => {
     const src = join(outDir, from);
@@ -435,33 +460,51 @@ async function promoteDraftAsFinal(
     copyFileSync(src, join(outDir, to));
     return true;
   };
-  copy("draft.scad", "final.scad");
-  const haveStl = exportStl ? copy("draft.stl", "final.stl") : false;
-  const haveObj = copy("draft.obj", "final.obj");
-  const summary = "refine disabled (--no-refine); final.* is the unrefined draft.";
-  writeFileSync(
-    join(outDir, "final_summary.txt"),
-    `verdict: skipped\n\nsummary:\n${summary}\n`,
-    "utf8",
-  );
+  const summary = profile === "open-loop"
+    ? "open-loop incremental draft promoted without refinement."
+    : "refine disabled (--no-refine); final.* is the unrefined draft.";
+  const finalScad = join(outDir, "final.scad");
+  const finalObj = join(outDir, "final.obj");
+  const finalSummary = join(outDir, "final_summary.txt");
+  let haveStl = false;
+  let haveObj = false;
+  try {
+    const haveScad = copy("draft.scad", "final.scad");
+    haveStl = exportStl ? copy("draft.stl", "final.stl") : false;
+    haveObj = copy("draft.obj", "final.obj");
+    writeFileSync(
+      finalSummary,
+      `verdict: ${profile === "open-loop" ? "ok" : "skipped"}\n\nsummary:\n${summary}\n`,
+      "utf8",
+    );
+    if (profile === "open-loop" &&
+      (!haveScad || !haveObj || statSync(finalScad).size === 0 || statSync(finalObj).size === 0)) {
+      throw new Error("open-loop promotion produced incomplete final artifacts");
+    }
+  } catch (error) {
+    if (profile === "open-loop") {
+      for (const path of [finalScad, finalObj, finalSummary]) rmSync(path, { force: true });
+    }
+    throw error;
+  }
 
   // AO preview — same treatment as the refine path's writeFinalOutputs, just
   // sourced from the draft build's STL instead of a fresh _final_build one.
   let previewDir: string | undefined;
   const buildStl = join(outDir, "_draft_build", "output.stl");
-  if (existsSync(buildStl)) {
+  if (profile === "standard" && existsSync(buildStl)) {
     const dir = join(outDir, "preview_final");
     mkdirSync(dir, { recursive: true });
     const pr = await renderAOViews({ stlPath: buildStl, outDir: dir, size: 640, samples: 32, aoSamples: 8 });
     if (pr.ok) previewDir = dir;
     else console.log(`  WARN: AO preview failed: ${pr.error}`);
-  } else {
+  } else if (profile === "standard") {
     console.log(`  WARN: AO preview skipped — no _draft_build/output.stl found`);
   }
 
   return {
     ok: true,
-    verdict: "skipped",
+    verdict: profile === "open-loop" ? "ok" : "skipped",
     summary,
     outputs: {
       scadPath: join(outDir, "final.scad"),

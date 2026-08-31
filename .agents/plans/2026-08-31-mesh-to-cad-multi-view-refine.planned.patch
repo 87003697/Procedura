@@ -1,0 +1,417 @@
+diff --git a/README.md b/README.md
+index d3efdfd..d942ad1 100644
+--- a/README.md
++++ b/README.md
+@@ -133,6 +133,14 @@ metres; 3MF uses its declared unit and defined coordinate transform:
+ bun run mesh-to-cad --mesh reference.stl -o outputs/reference-cad
+ ```
+ 
++Add `--refine` to keep the same Plan 2 → Plan 3 pipeline but enable its
++whole-model Phase 2: the reference Mesh is rendered from seven named views and
++the generated draft is reviewed and repaired against those public images.
++
++```bash
++bun run mesh-to-cad --mesh reference.stl -o outputs/reference-cad --refine
++```
++
+ Set `PROCEDURA_REFERENCE_ROOT` to a directory outside the Procedura checkout
+ and outputs root. By default, Plan 2 renders one public isometric `image.png`;
+ programmatic callers may select additional named views from the existing view
+@@ -148,8 +156,12 @@ and `final.obj` on success. Selected supplementary views are retained as
+ geometry-only binary STL in Z-up millimetres; STL/OBJ/PLY retain their
+ preconditioned coordinates, while glTF/GLB convert Y-up/metres to
+ Z-up/millimetres.
+-This is intentionally open-loop: no source-vs-generated comparison, refine or
+-repair loop, closed-loop iteration, four-view/brief/scoring workflow,
++Without `--refine`, Mesh-to-CAD promotes the Plan 3 draft without review. With
++`--refine`, the same unified pipeline uses Procedura's existing direct
++compile/critic/patch/gate loop and writes its normal `_refine_steps/`,
++`preview_final/`, and `final_summary.txt` artifacts. This is image-space review,
++not 3D source-to-generated measurement. The default path has no refine or repair
++loop, closed-loop iteration, four-view/brief/scoring workflow,
+ STEP/build123d, or material/texture processing.
+ 
+ ### The best-quality run
+diff --git a/scripts/mesh-to-cad.ts b/scripts/mesh-to-cad.ts
+index 542f0fe..ee7d49a 100644
+--- a/scripts/mesh-to-cad.ts
++++ b/scripts/mesh-to-cad.ts
+@@ -5,11 +5,12 @@ interface Args {
+   meshPath: string;
+   referenceRoot?: string;
+   runsRoot?: string;
++  refine: boolean;
+ }
+ 
+ function help(): never {
+   console.log(`
+-Mesh-to-CAD — private reference import, image-based planning, and open-loop CAD generation.
++Mesh-to-CAD — private reference import, image-based planning, and optional multi-view refine.
+ 
+ Usage:
+   bun run mesh-to-cad --mesh reference.stl -o outputs/reference-cad
+@@ -18,19 +19,21 @@ Options:
+   --mesh PATH                 import STL, OBJ, PLY, GLB, glTF, or 3MF
+   --reference-root PATH       private store root (or PROCEDURA_REFERENCE_ROOT)
+   --runs-root PATH            Studio runs root (or PROCEDURA_OUTPUTS_ROOT)
++  --refine                    refine the generated draft against seven reference views
+   -o, --output PATH           output run directory
+ `);
+   process.exit(0);
+ }
+ 
+ function parse(argv: string[]): Args {
+-  const args: Args = { outputDir: "", meshPath: "" };
++  const args: Args = { outputDir: "", meshPath: "", refine: false };
+   for (let i = 0; i < argv.length; i++) {
+     const value = argv[i]!;
+     if (value === "-o" || value === "--output") args.outputDir = argv[++i]!;
+     else if (value === "--mesh") args.meshPath = argv[++i]!;
+     else if (value === "--reference-root") args.referenceRoot = argv[++i]!;
+     else if (value === "--runs-root") args.runsRoot = argv[++i]!;
++    else if (value === "--refine") args.refine = true;
+     else if (value === "-h" || value === "--help") help();
+     else throw new Error(`unknown flag: ${value}`);
+   }
+@@ -46,6 +49,7 @@ const result = await runMeshToCadGeneration({
+   meshPath: args.meshPath,
+   ...(args.referenceRoot ? { referenceRoot: args.referenceRoot } : {}),
+   ...(args.runsRoot ? { runsRoot: args.runsRoot } : {}),
++  ...(args.refine ? { refine: true } : {}),
+ });
+ console.log(`reference: ${result.reference.handle}`);
+ console.log(`dimensions: ${result.summary.dimensions.join(" × ")} ${result.summary.units}`);
+diff --git a/src/pipeline/mesh-to-cad-generation.ts b/src/pipeline/mesh-to-cad-generation.ts
+index 16f89da..803fe98 100644
+--- a/src/pipeline/mesh-to-cad-generation.ts
++++ b/src/pipeline/mesh-to-cad-generation.ts
+@@ -1,11 +1,12 @@
+-import { copyFileSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
++import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
+ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+-import { runIncrementalDraft, parsePlanJson } from "./draft-incremental.ts";
+ import {
+   planReferenceRun,
+   type PlanReferenceRunOpts,
+   type PlanReferenceRunResult,
+ } from "./mesh-to-cad-plan.ts";
++import { runProcedura } from "./procedura.ts";
++import type { ViewName } from "../render/views.ts";
+ 
+ const PROCEDURA_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..", "..");
+ const STALE_FILES = [
+@@ -16,8 +17,11 @@ const STALE_FILES = [
+ ];
+ const STALE_DIRS = [
+   "preview_final", "preview_painted", "preview_ao", "preview_ao_ortho",
+-  "preview_final.tmp", "_final_build", "motion",
++  "preview_final.tmp", "_final_build", "_refine_steps", "motion",
+ ];
++const REFINE_REFERENCE_VIEWS = [
++  "isometric", "front", "back", "left", "right", "top", "bottom",
++] as const satisfies readonly ViewName[];
+ 
+ function isInside(path: string, root: string): boolean {
+   const rel = relative(root, path);
+@@ -25,8 +29,9 @@ function isInside(path: string, root: string): boolean {
+ }
+ 
+ export async function runMeshToCadGeneration(
+-  opts: PlanReferenceRunOpts,
++  opts: PlanReferenceRunOpts & { refine?: boolean },
+ ): Promise<PlanReferenceRunResult> {
++  const { refine = false, ...planOpts } = opts;
+   const outputDir = resolve(opts.outputDir);
+   if (existsSync(outputDir) && !statSync(outputDir).isDirectory()) {
+     throw new Error("outputDir must be a directory");
+@@ -37,42 +42,39 @@ export async function runMeshToCadGeneration(
+   if (!isInside(outputDir, runsRoot)) throw new Error("outputDir must be inside runsRoot");
+   for (const file of STALE_FILES) rmSync(resolve(outputDir, file), { force: true });
+   for (const dir of STALE_DIRS) rmSync(resolve(outputDir, dir), { recursive: true, force: true });
+-  const planned = await planReferenceRun({ ...opts, maxParts: 0 });
++  const planned = await planReferenceRun({
++    ...planOpts,
++    ...(refine ? { referenceViews: REFINE_REFERENCE_VIEWS } : {}),
++    maxParts: 0,
++  });
+   const imagePath = resolve(planned.outputDir, "image.png");
+   const planPath = resolve(planned.outputDir, "plan.json");
+   if (!existsSync(imagePath) || !existsSync(planPath)) {
+     throw new Error("Mesh-to-CAD generation requires Plan 2 image.png and plan.json");
+   }
+   const planText = readFileSync(planPath, "utf8");
+-  const plan = parsePlanJson(planText, 0);
+-  if (!plan.length) throw new Error("Mesh-to-CAD generation requires a non-empty plan");
+-  const draft = await runIncrementalDraft({
++  const generated = await runProcedura({
+     text: "Generate editable CAD from this host-produced plan:\n\n" + planText,
+     outputDir: planned.outputDir,
++    incremental: true,
+     inputImages: planned.referenceImages.map((image) => ({
+       label: image.view,
+       path: image.path,
+     })),
+     inputPlan: planPath,
++    redo: true,
++    refine,
++    refineMode: "direct",
++    draftPromotion: "open-loop",
+   });
+-  const draftObj = draft.objPath;
+-  if (!draft.ok || !existsSync(draft.scadPath) || !draftObj || !existsSync(draftObj) ||
+-    statSync(draft.scadPath).size === 0 || statSync(draftObj).size === 0) {
+-    throw new Error(`Mesh-to-CAD generation did not produce a complete draft: ${draft.compileError ?? "unknown failure"}`);
+-  }
+   const finalScad = resolve(outputDir, "final.scad");
+   const finalObj = resolve(outputDir, "final.obj");
+-  const finalSummary = resolve(outputDir, "final_summary.txt");
+-  try {
+-    copyFileSync(draft.scadPath, finalScad);
+-    copyFileSync(draftObj, finalObj);
+-    writeFileSync(finalSummary, "verdict: ok\n\nsummary:\nopen-loop incremental draft promoted without refinement.\n", "utf8");
+-    if (statSync(finalScad).size === 0 || statSync(finalObj).size === 0) {
+-      throw new Error("Mesh-to-CAD generation produced empty final artifacts");
+-    }
+-  } catch (error) {
+-    for (const path of [finalScad, finalObj, finalSummary]) rmSync(path, { force: true });
+-    throw error;
++  if (!generated.refine.ok) {
++    throw new Error(`Mesh-to-CAD refine ended with verdict: ${generated.refine.verdict}`);
++  }
++  if (!existsSync(finalScad) || !existsSync(finalObj) ||
++    statSync(finalScad).size === 0 || statSync(finalObj).size === 0) {
++    throw new Error("Mesh-to-CAD generation did not produce complete final artifacts");
+   }
+   return planned;
+ }
+diff --git a/src/pipeline/procedura.ts b/src/pipeline/procedura.ts
+index a24c570..c165cd7 100644
+--- a/src/pipeline/procedura.ts
++++ b/src/pipeline/procedura.ts
+@@ -23,7 +23,9 @@
+  *   { text, outputDir, redo }          — force re-draft even if artifacts exist
+  */
+ 
+-import { existsSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
++import {
++  existsSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, readdirSync, rmSync, statSync,
++} from "node:fs";
+ import { join, resolve } from "node:path";
+ 
+ import { createFileTrajectoryWriter } from "../trajectory/writer.ts";
+@@ -51,6 +53,11 @@ export interface RunProceduraOpts {
+   /** When set, skip image-gen in the draft phase and use this image file as
+    *  the reference (copied to <outputDir>/image.png). SCAD-gen still runs. */
+   inputImage?: string;
++  /** Ordered provided views for incremental draft. The first is authoritative.
++   * The same set is reused by direct whole-model refine when enabled. */
++  inputImages?: readonly { label: string; path: string }[];
++  /** Host-produced plan.json for incremental draft; skips internal planning. */
++  inputPlan?: string;
+   /** Text-only: generate with NO reference image at all. Skips image-gen in the
+    *  draft; refine and paint follow automatically by detecting the absent
+    *  image.png. Incremental draft only — `runDraft` still needs an image. */
+@@ -112,6 +119,10 @@ export interface RunProceduraOpts {
+    * the final model: draft.{scad,stl,obj} are promoted to final.* and a
+    * synthetic verdict="skipped" RefineResult is returned (no refine loop). */
+   refine?: boolean;
++  /** Select the Phase 2 implementation. Defaults to PROCEDURA_REFINE_MODE, then direct. */
++  refineMode?: "direct" | "agent";
++  /** Promotion profile when refine is disabled. Default preserves normal Procedura artifacts. */
++  draftPromotion?: "standard" | "open-loop";
+   /** Persist the binary STL deliverable (draft.stl / final.stl) alongside the
+    * OBJ. Default false — only the normalized OBJ (+ SCAD) is exported; STL is
+    * kept in internal build dirs for connectivity/rendering. */
+@@ -292,9 +303,12 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
+           outputDir: outDir,
+           ...(opts.scadModel !== undefined ? { scadModel: opts.scadModel } : {}),
+           ...(opts.imageModel !== undefined ? { imageModel: opts.imageModel } : {}),
+-          ...(opts.inputImage !== undefined
+-            ? { inputImages: [{ label: "primary", path: opts.inputImage }] }
+-            : {}),
++          ...(opts.inputImages !== undefined
++            ? { inputImages: opts.inputImages }
++            : opts.inputImage !== undefined
++              ? { inputImages: [{ label: "primary", path: opts.inputImage }] }
++              : {}),
++          ...(opts.inputPlan !== undefined ? { inputPlan: opts.inputPlan } : {}),
+           ...(opts.textOnly ? { textOnly: true } : {}),
+           ...(opts.contextRenders ? { contextRenders: true } : {}),
+           ...(opts.extraRefs !== undefined ? { extraRefs: opts.extraRefs } : {}),
+@@ -335,16 +349,18 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
+     let refineResult: RefineResult;
+     if (opts.refine === false) {
+       console.log(`\n--- Phase 2: refine SKIPPED (--no-refine) — promoting draft → final ---`);
+-      refineResult = await promoteDraftAsFinal(outDir, writer.path, exportStl);
++      refineResult = await promoteDraftAsFinal(
++        outDir, writer.path, exportStl, opts.draftPromotion ?? "standard",
++      );
+     } else {
+       // Refine implementation. `direct` (the default) runs the fixed
+       // context → critic → measure → patch → gate cycle as a pipeline; `agent`
+       // is the historical seventeen-tool loop, kept for A/B until the benchmark
+       // has ruled on the swap. PROCEDURA_REFINE_MODE=agent restores it.
+-      const refineMode = process.env["PROCEDURA_REFINE_MODE"] === "agent" ? "agent" : "direct";
++      const refineMode = opts.refineMode
++        ?? (process.env["PROCEDURA_REFINE_MODE"] === "agent" ? "agent" : "direct");
+       console.log(`\n--- Phase 2: refine (${refineMode}) ---`);
+-      const refineImpl = refineMode === "agent" ? runRefine : runDirectRefine;
+-      refineResult = await refineImpl({
++      const refineOpts = {
+         outputDir: outDir,
+         ...(opts.agentModel !== undefined ? { model: opts.agentModel } : {}),
+         ...(opts.maxSteps !== undefined ? { maxSteps: opts.maxSteps } : {}),
+@@ -352,7 +368,13 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
+         ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+         trajectorySink: writer.sink,
+         trajectoryPathOverride: writer.path,
+-      });
++      };
++      refineResult = refineMode === "agent"
++        ? await runRefine(refineOpts)
++        : await runDirectRefine({
++            ...refineOpts,
++            ...(opts.inputImages !== undefined ? { referenceImages: opts.inputImages } : {}),
++          });
+     }
+ 
+     // ── Phase 3: paint (opt-in material pass) ─────────────────────────────
+@@ -427,7 +449,10 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
+  * final_summary.txt, and return a synthetic verdict="skipped" RefineResult. The
+  * draft stage already normalized draft.obj, so final.obj is normalized too. */
+ async function promoteDraftAsFinal(
+-  outDir: string, trajectoryPath: string, exportStl: boolean,
++  outDir: string,
++  trajectoryPath: string,
++  exportStl: boolean,
++  profile: "standard" | "open-loop",
+ ): Promise<RefineResult> {
+   const copy = (from: string, to: string): boolean => {
+     const src = join(outDir, from);
+@@ -435,33 +460,51 @@ async function promoteDraftAsFinal(
+     copyFileSync(src, join(outDir, to));
+     return true;
+   };
+-  copy("draft.scad", "final.scad");
+-  const haveStl = exportStl ? copy("draft.stl", "final.stl") : false;
+-  const haveObj = copy("draft.obj", "final.obj");
+-  const summary = "refine disabled (--no-refine); final.* is the unrefined draft.";
+-  writeFileSync(
+-    join(outDir, "final_summary.txt"),
+-    `verdict: skipped\n\nsummary:\n${summary}\n`,
+-    "utf8",
+-  );
++  const summary = profile === "open-loop"
++    ? "open-loop incremental draft promoted without refinement."
++    : "refine disabled (--no-refine); final.* is the unrefined draft.";
++  const finalScad = join(outDir, "final.scad");
++  const finalObj = join(outDir, "final.obj");
++  const finalSummary = join(outDir, "final_summary.txt");
++  let haveStl = false;
++  let haveObj = false;
++  try {
++    const haveScad = copy("draft.scad", "final.scad");
++    haveStl = exportStl ? copy("draft.stl", "final.stl") : false;
++    haveObj = copy("draft.obj", "final.obj");
++    writeFileSync(
++      finalSummary,
++      `verdict: ${profile === "open-loop" ? "ok" : "skipped"}\n\nsummary:\n${summary}\n`,
++      "utf8",
++    );
++    if (profile === "open-loop" &&
++      (!haveScad || !haveObj || statSync(finalScad).size === 0 || statSync(finalObj).size === 0)) {
++      throw new Error("open-loop promotion produced incomplete final artifacts");
++    }
++  } catch (error) {
++    if (profile === "open-loop") {
++      for (const path of [finalScad, finalObj, finalSummary]) rmSync(path, { force: true });
++    }
++    throw error;
++  }
+ 
+   // AO preview — same treatment as the refine path's writeFinalOutputs, just
+   // sourced from the draft build's STL instead of a fresh _final_build one.
+   let previewDir: string | undefined;
+   const buildStl = join(outDir, "_draft_build", "output.stl");
+-  if (existsSync(buildStl)) {
++  if (profile === "standard" && existsSync(buildStl)) {
+     const dir = join(outDir, "preview_final");
+     mkdirSync(dir, { recursive: true });
+     const pr = await renderAOViews({ stlPath: buildStl, outDir: dir, size: 640, samples: 32, aoSamples: 8 });
+     if (pr.ok) previewDir = dir;
+     else console.log(`  WARN: AO preview failed: ${pr.error}`);
+-  } else {
++  } else if (profile === "standard") {
+     console.log(`  WARN: AO preview skipped — no _draft_build/output.stl found`);
+   }
+ 
+   return {
+     ok: true,
+-    verdict: "skipped",
++    verdict: profile === "open-loop" ? "ok" : "skipped",
+     summary,
+     outputs: {
+       scadPath: join(outDir, "final.scad"),
+diff --git a/src/pipeline/refine-direct.ts b/src/pipeline/refine-direct.ts
+index a653f93..fe7a299 100644
+--- a/src/pipeline/refine-direct.ts
++++ b/src/pipeline/refine-direct.ts
+@@ -237,7 +237,12 @@ async function measureModules(
+ // The driver
+ // ──────────────────────────────────────────────────────────────────────────
+ 
+-export async function runDirectRefine(opts: RefineOpts): Promise<RefineResult> {
++export interface DirectRefineOpts extends RefineOpts {
++  /** Explicit ordered references supplied by the unified pipeline. */
++  referenceImages?: readonly { label: string; path: string }[];
++}
++
++export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineResult> {
+   const workspace = resolveWorkspace(opts.outputDir);
+   const state = createSessionState(
+     workspace,
+@@ -252,19 +257,33 @@ export async function runDirectRefine(opts: RefineOpts): Promise<RefineResult> {
+ 
+   const criticSystem = readFileSync(DIAGNOSE_PROMPT_PATH, "utf8");
+   const patchSystem = readFileSync(PATCH_PROMPT_PATH, "utf8");
+-  // In a text-only run there is no image.png, so the TARGET the critic compares
+-  // renders against is the spec sentence. Both call sites take this block whole,
+-  // so neither has to know which mode it is in.
+-  const referenceParts: CanonicalPart[] = workspace.hasImage
+-    ? [
+-        { kind: "text", text: "REFERENCE image (target):" },
+-        { kind: "image", data: readFileSync(workspace.imagePath).toString("base64"), mimeType: "image/png" },
+-      ]
+-    : [{
++  // Both call sites consume this block whole, so the loop does not need to
++  // distinguish multi-view, single-image, and text-only runs.
++  const referenceParts: CanonicalPart[] = [];
++  if (opts.referenceImages?.length) {
++    opts.referenceImages.forEach((image, index) => {
++      referenceParts.push({
++        kind: "text",
++        text: `REFERENCE view ${index + 1} (${image.label}${index === 0 ? ", primary" : ""}):`,
++      });
++      referenceParts.push({
++        kind: "image",
++        data: readFileSync(image.path).toString("base64"),
++        mimeType: "image/png",
++      });
++    });
++  } else if (workspace.hasImage) {
++    referenceParts.push(
++      { kind: "text", text: "REFERENCE image (target):" },
++      { kind: "image", data: readFileSync(workspace.imagePath).toString("base64"), mimeType: "image/png" },
++    );
++  } else {
++    referenceParts.push({
+         kind: "text",
+         text: "TARGET — there is NO reference image for this object. The text " +
+               "specification is the complete and only target:\n\n" + workspace.text,
+-      }];
++    });
++  }
+ 
+   const log = (s: string): void => console.log(s);
+   log(`\n=== ${opts.bannerLabel ?? "Procedura refine (direct)"} ===`);
+

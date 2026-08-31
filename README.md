@@ -133,6 +133,14 @@ metres; 3MF uses its declared unit and defined coordinate transform:
 bun run mesh-to-cad --mesh reference.stl -o outputs/reference-cad
 ```
 
+Add `--refine` to keep the same Plan 2 → Plan 3 pipeline but enable its
+whole-model Phase 2: the reference Mesh is rendered from seven named views and
+the generated draft is reviewed and repaired against those public images.
+
+```bash
+bun run mesh-to-cad --mesh reference.stl -o outputs/reference-cad --refine
+```
+
 Set `PROCEDURA_REFERENCE_ROOT` to a directory outside the Procedura checkout
 and outputs root. By default, Plan 2 renders one public isometric `image.png`;
 programmatic callers may select additional named views from the existing view
@@ -148,8 +156,12 @@ and `final.obj` on success. Selected supplementary views are retained as
 geometry-only binary STL in Z-up millimetres; STL/OBJ/PLY retain their
 preconditioned coordinates, while glTF/GLB convert Y-up/metres to
 Z-up/millimetres.
-This is intentionally open-loop: no source-vs-generated comparison, refine or
-repair loop, closed-loop iteration, four-view/brief/scoring workflow,
+Without `--refine`, Mesh-to-CAD promotes the Plan 3 draft without review. With
+`--refine`, the same unified pipeline uses Procedura's existing direct
+compile/critic/patch/gate loop and writes its normal `_refine_steps/`,
+`preview_final/`, and `final_summary.txt` artifacts. This is image-space review,
+not 3D source-to-generated measurement. The default path has no refine or repair
+loop, closed-loop iteration, four-view/brief/scoring workflow,
 STEP/build123d, or material/texture processing.
 
 ### The best-quality run
