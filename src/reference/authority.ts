@@ -13,6 +13,7 @@ import { extname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { computeBBox, loadSTL } from "../mesh/stl.ts";
 import { renderAOViews } from "../render/ao.ts";
+import type { ViewName } from "../render/views.ts";
 import { normalizeReference, type ReferenceFormat } from "./normalization.ts";
 
 export type { ReferenceFormat } from "./normalization.ts";
@@ -39,6 +40,11 @@ export interface ReferenceSummary {
 export interface ReferenceViewerMesh {
   format: "stl";
   bytes: ArrayBuffer;
+}
+
+export interface RenderedReferenceImage {
+  view: ViewName;
+  bytes: Uint8Array;
 }
 
 export function formatOf(path: string): ReferenceFormat {
@@ -132,16 +138,22 @@ export class ReferenceAuthority {
     };
   }
 
-  async renderReferenceImage(handle: string): Promise<Uint8Array> {
+  async renderReferenceImages(
+    handle: string,
+    views: readonly ViewName[],
+  ): Promise<RenderedReferenceImage[]> {
     const record = this.#record(handle);
     const renderDir = join(record.dir, "render");
     const result = await renderAOViews({
       stlPath: record.canonicalPath,
       outDir: renderDir,
-      views: ["isometric"],
+      views,
     });
     if (!result.ok) throw new Error(result.error);
-    return readFileSync(join(renderDir, "ao-isometric.png"));
+    return views.map((view) => ({
+      view,
+      bytes: readFileSync(join(renderDir, `ao-${view}.png`)),
+    }));
   }
 
   #record(handle: string): PrivateManifest & { dir: string; canonicalPath: string } {

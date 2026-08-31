@@ -292,7 +292,9 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
           outputDir: outDir,
           ...(opts.scadModel !== undefined ? { scadModel: opts.scadModel } : {}),
           ...(opts.imageModel !== undefined ? { imageModel: opts.imageModel } : {}),
-          ...(opts.inputImage !== undefined ? { inputImage: opts.inputImage } : {}),
+          ...(opts.inputImage !== undefined
+            ? { inputImages: [{ label: "primary", path: opts.inputImage }] }
+            : {}),
           ...(opts.textOnly ? { textOnly: true } : {}),
           ...(opts.contextRenders ? { contextRenders: true } : {}),
           ...(opts.extraRefs !== undefined ? { extraRefs: opts.extraRefs } : {}),

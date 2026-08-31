@@ -125,7 +125,7 @@ bun run scripts/procedura.ts -o outputs/daybed \
 ### Mesh-to-CAD planning
 
 Import STL, OBJ, PLY, GLB, glTF, or 3MF into the private reference store
-then use its single image and plan for open-loop CAD generation. STL, OBJ, and
+then use its rendered reference images and plan for open-loop CAD generation. STL, OBJ, and
 PLY coordinates must already be Z-up millimetres; glTF/GLB use standard Y-up
 metres; 3MF uses its declared unit and defined coordinate transform:
 
@@ -134,13 +134,17 @@ bun run mesh-to-cad --mesh reference.stl -o outputs/reference-cad
 ```
 
 Set `PROCEDURA_REFERENCE_ROOT` to a directory outside the Procedura checkout
-and outputs root. Plan 2's planner receives only the single public `image.png`
-and bounded Z-up/mm geometry summary, and writes `plan.json`. Plan 3's
-incremental generator receives only that public `image.png` and `plan.json`.
+and outputs root. By default, Plan 2 renders one public isometric `image.png`;
+programmatic callers may select additional named views from the existing view
+catalog, with the first view remaining authoritative. Plan 2's planner receives
+only those public images and the bounded Z-up/mm geometry summary, and writes
+`plan.json`. Plan 3's incremental generator receives the same public images and
+`plan.json`.
 Neither call receives the reference handle, private canonical Mesh, source
 bytes or paths, manifest, materials, textures, or host metadata. The command
 retains `reference.json`, `image.png`, and `plan.json`, and adds `final.scad`
-and `final.obj` on success. Canonical output remains
+and `final.obj` on success. Selected supplementary views are retained as
+`image-<view>.png`. Canonical output remains
 geometry-only binary STL in Z-up millimetres; STL/OBJ/PLY retain their
 preconditioned coordinates, while glTF/GLB convert Y-up/metres to
 Z-up/millimetres.

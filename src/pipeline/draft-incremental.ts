@@ -394,9 +394,9 @@ export interface IncrementalDraftOpts {
   /** Model for the plan + per-part generation calls. Default = scad model. */
   scadModel?: string;
   imageModel?: string;
-  /** When set, skip image-gen and use this image file as the reference (copied
-   * to <outputDir>/image.png). Mirrors runDraft's `inputImage`. */
-  inputImage?: string;
+  /** Ordered provided views. The first is authoritative and copied to image.png;
+   * later views are supplementary. One entry is the single-view form. */
+  inputImages?: readonly { label: string; path: string }[];
   /** Host-produced plan.json; skips planner and reviewer when supplied. */
   inputPlan?: string;
   /**
@@ -2175,6 +2175,7 @@ export async function runIncrementalDraft(
   // Text-only and a supplied input image are contradictory; the explicit flag
   // wins and says so, rather than silently using the image it was told to skip.
   const textOnly = opts.textOnly ?? false;
+  const providedImages = opts.inputImages ?? [];
   const feedbackRenderSize = Number(process.env["PROCEDURA_FEEDBACK_RENDER_SIZE"] ?? "1024");
   const inputPlan = opts.inputPlan;
   const suppliedPlan = inputPlan !== undefined;
@@ -2286,8 +2287,8 @@ export async function runIncrementalDraft(
       // here would look identical to a failed image-gen in the log.
       log(`[inc-draft] TEXT-ONLY — no reference image will be generated or used`);
       emit("draft.image.skipped", { source: "text-only", bytes: 0 });
-    } else if (opts.inputImage) {
-      const src = resolve(opts.inputImage);
+    } else if (providedImages.length > 0) {
+      const src = resolve(providedImages[0]!.path);
       if (!existsSync(src)) throw new Error(`inputImage not found: ${src}`);
       log(`[inc-draft] image-gen SKIPPED — using provided image ${src}`);
       if (resolve(imagePath) !== src) copyFileSync(src, imagePath);
@@ -2320,7 +2321,14 @@ export async function runIncrementalDraft(
     const extraRefs = canGenExtras ? wantExtraRefs : 0;
     if (!textOnly && refImageSize > 0) log(`[inc-draft] reference images normalized to ${refImageSize}px longest-side`);
     const refImages: { label: string; b64: string }[] = textOnly ? [] : [
-      { label: "primary", b64: loadImageBase64(imagePath, refImageSize) },
+      {
+        label: providedImages[0]?.label ?? "primary",
+        b64: loadImageBase64(imagePath, refImageSize),
+      },
+      ...providedImages.slice(1).map((image) => ({
+        label: image.label,
+        b64: loadImageBase64(resolve(image.path), refImageSize),
+      })),
     ];
     for (let k = 0; k < extraRefs; k++) {
       if (opts.signal?.aborted) break;
@@ -2334,14 +2342,14 @@ export async function runIncrementalDraft(
         log(`[inc-draft] extra ref ${k + 2} gen failed: ${(e as Error).message} — skipping`);
       }
     }
-    if (extraRefs > 0) {
+    if (refImages.length > 1) {
       log(`[inc-draft] multi-ref: attaching ${refImages.length} reference image(s) to plan + gen calls`);
       emit("draft.multiref.ready", { refCount: refImages.length });
     }
 
     // Attach the full reference set under `header`. With a single ref the format
     // is unchanged; with several, the primary is flagged authoritative and the
-    // generated alternates as supplementary viewpoints.
+    // remaining images as supplementary viewpoints.
     const refParts = (header: string): CanonicalPart[] => {
       // Text-only: say plainly that there is no image rather than attaching
       // none silently. A prompt whose body says "match the reference" with no
@@ -2365,7 +2373,7 @@ export async function runIncrementalDraft(
       const parts: CanonicalPart[] = [{
         kind: "text",
         text: `${header} — ${refImages.length} views. View 1 is the PRIMARY, ` +
-          `authoritative reference (match it); the others are generated alternate ` +
+          `authoritative reference (match it); the others are supplementary ` +
           `viewpoints for extra shape context:`,
       }];
       refImages.forEach((r, idx) => {

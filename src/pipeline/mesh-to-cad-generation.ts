@@ -49,7 +49,10 @@ export async function runMeshToCadGeneration(
   const draft = await runIncrementalDraft({
     text: "Generate editable CAD from this host-produced plan:\n\n" + planText,
     outputDir: planned.outputDir,
-    inputImage: imagePath,
+    inputImages: planned.referenceImages.map((image) => ({
+      label: image.view,
+      path: image.path,
+    })),
     inputPlan: planPath,
   });
   const draftObj = draft.objPath;
