@@ -397,6 +397,8 @@ export interface IncrementalDraftOpts {
   /** When set, skip image-gen and use this image file as the reference (copied
    * to <outputDir>/image.png). Mirrors runDraft's `inputImage`. */
   inputImage?: string;
+  /** Host-produced plan.json; skips planner and reviewer when supplied. */
+  inputPlan?: string;
   /**
    * Text-only mode: generate from the prompt with NO reference image at all.
    *
@@ -2174,7 +2176,9 @@ export async function runIncrementalDraft(
   // wins and says so, rather than silently using the image it was told to skip.
   const textOnly = opts.textOnly ?? false;
   const feedbackRenderSize = Number(process.env["PROCEDURA_FEEDBACK_RENDER_SIZE"] ?? "1024");
-  const CONTEXT_VIEWS = resolveContextViews(opts.contextRenders ?? false);
+  const inputPlan = opts.inputPlan;
+  const suppliedPlan = inputPlan !== undefined;
+  const CONTEXT_VIEWS = suppliedPlan ? [] : resolveContextViews(opts.contextRenders ?? false);
   // Assembly-aware incremental mode (Slice 1: mating-feature library + prompt).
   // Same opt-in-plus-kill-switch shape as motionAware; independent of it.
   const assemblyAware = (opts.assemblyAware ?? false) &&
@@ -2188,7 +2192,7 @@ export async function runIncrementalDraft(
   // (the env form is what the benchmark rig sets, so an ablation arm is a config
   // push and not a second code path). Off → every prompt and every call in this
   // file is byte-identical to the planned pipeline.
-  const noPlan = (opts.noPlan ?? false) || process.env["PROCEDURA_NO_PLAN"] === "1";
+  const noPlan = !suppliedPlan && ((opts.noPlan ?? false) || process.env["PROCEDURA_NO_PLAN"] === "1");
 
   // Trajectory: shared sink (unified pipeline) or a local file.
   const trajectoryDir = join(outDir, "_trajectory");
@@ -2246,7 +2250,7 @@ export async function runIncrementalDraft(
   const planJsonPath = join(outDir, "plan.json");
   // Resume a killed draft: reuse the plan + the parts already committed to
   // draft.scad, and continue from the first uncommitted part.
-  const resuming = Boolean(opts.resume) && existsSync(planJsonPath) && existsSync(scadPath);
+  const resuming = !suppliedPlan && Boolean(opts.resume) && existsSync(planJsonPath) && existsSync(scadPath);
   // Assembly-aware: inline the mating-feature helper library into the seed so
   // both mating parts call identical helpers (fit by construction) and every
   // derived compile stays self-contained. On RESUME the committed draft.scad
@@ -2375,7 +2379,13 @@ export async function runIncrementalDraft(
     };
 
     // ── Stage B: plan ───────────────────────────────────────────────────
-    if (!noPlan) {
+    if (inputPlan !== undefined && !resuming) {
+      const sourcePlan = resolve(inputPlan);
+      if (!existsSync(sourcePlan)) throw new Error("inputPlan not found: " + sourcePlan);
+      plan.push(...parsePlanJson(readFileSync(sourcePlan, "utf8"), 0));
+      writeFileSync(planJsonPath, JSON.stringify(plan, null, 2), "utf8");
+      emit("draft.plan.ready", { partCount: plan.length, source: "provided" });
+    } else if (!noPlan) {
       log(`[inc-draft] planning parts`);
       emit("draft.plan.requested");
     }
@@ -2403,7 +2413,7 @@ export async function runIncrementalDraft(
       // killed run still leaves the parts it decided on, in order.
       if (!resuming) writeFileSync(planJsonPath, "[]", "utf8");
     }
-    if (!noPlan && !resuming) {
+    if (!noPlan && !suppliedPlan && !resuming) {
       let planErr: string | null = null;
       for (let attempt = 1; attempt <= PLAN_MAX_ATTEMPTS; attempt++) {
         const planUserText =
@@ -2455,7 +2465,7 @@ export async function runIncrementalDraft(
     // stops reviewing and proceeds with the best plan so far (never kills the
     // run). Set PROCEDURA_PLAN_REVIEW_ITERS=0 to disable.
     const planReviewIters = opts.planReviewIters ?? DEFAULT_PLAN_REVIEW_ITERS;
-    if (!noPlan && !resuming && planReviewIters > 0) {
+    if (!noPlan && !suppliedPlan && !resuming && planReviewIters > 0) {
       const planReviewSystem = readFileSync(PLAN_REVIEW_SYSTEM_PATH, "utf8") +
         planMotionAddendum + planAssemblyAddendum +
         (motionAware ? "\n\n" + PLAN_REVIEW_MOTION_NOTE : "") +
@@ -2535,12 +2545,12 @@ export async function runIncrementalDraft(
     let floatersBefore = 0;
     // Gate is on by default; set PROCEDURA_INCREMENTAL_CONN_GATE=0 to reproduce the
     // pre-gate baseline (commit every part unconditionally, no connectivity check).
-    const connGateEnabled = (process.env["PROCEDURA_INCREMENTAL_CONN_GATE"] ?? "1") !== "0";
+    const connGateEnabled = !suppliedPlan && (process.env["PROCEDURA_INCREMENTAL_CONN_GATE"] ?? "1") !== "0";
     log(`[inc-draft] per-part connectivity gate: ${connGateEnabled ? "ON" : "OFF"}`);
     log(`[inc-draft] 3D feedback per part: ${CONTEXT_VIEWS.length ? CONTEXT_VIEWS.join(", ") : "OFF"}`);
     // Opt-in motion gate (pre-commit parent-attachment / non-parent-fusion
     // check on MOVING parts); default OFF — set PROCEDURA_INCREMENTAL_MOTION_GATE=1.
-    const motionGateEnabled =
+    const motionGateEnabled = !suppliedPlan &&
       motionAware && process.env["PROCEDURA_INCREMENTAL_MOTION_GATE"] === "1";
     if (motionAware) {
       log(`[inc-draft] motion-aware incremental: ON (sidecar → ${INCREMENTAL_MOTION_FILE}); ` +
@@ -2548,18 +2558,19 @@ export async function runIncrementalDraft(
     }
     // Opt-in pre-commit assembly gate (contact + interpenetration on parts with a
     // declared partner); default OFF — set PROCEDURA_INCREMENTAL_ASSEMBLY_GATE=1.
-    const assemblyGateEnabled =
+    const assemblyGateEnabled = !suppliedPlan &&
       assemblyAware && process.env["PROCEDURA_INCREMENTAL_ASSEMBLY_GATE"] === "1";
     // ── Profiling escape hatches. Both DEGRADE the build; they exist to
     // measure the floor cost of gen + split + render, not to ship with. ──
     // Skips every mate measurement, including the floater-override path that
     // rescues a correctly-seated clearance fit — so more parts read as floaters.
-    const skipMateCheck = process.env["PROCEDURA_SKIP_MATE_CHECK"] === "1";
+    const skipMateCheck = !suppliedPlan && process.env["PROCEDURA_SKIP_MATE_CHECK"] === "1";
     // Skips the per-part whole-assembly compile. That compile is ALSO how a
     // broken part is detected: without it there is no compile error to retry
     // on, no connectivity gate, and no build-so-far mesh, so parts commit
     // unvalidated and the draft can end up structurally wrong.
-    const skipPartCompile = process.env["PROCEDURA_SKIP_PART_COMPILE"] === "1";
+    const skipPartCompile = !suppliedPlan && process.env["PROCEDURA_SKIP_PART_COMPILE"] === "1";
+    const maxGenAttempts = suppliedPlan ? 1 : GEN_MAX_ATTEMPTS;
     if (skipMateCheck || skipPartCompile) {
       log(`  WARNING: profiling flags active — ` +
           `${skipPartCompile ? "per-part compile+gate OFF " : ""}` +
@@ -2768,7 +2779,7 @@ export async function runIncrementalDraft(
       // read for retry feedback.)
       let lastFailure: { kind: "compile" | "floater" | "motion" | "assembly"; detail: string } | null = null;
       let placedThisPart: string | null = null;
-      for (let attempt = 1; attempt <= GEN_MAX_ATTEMPTS; attempt++) {
+      for (let attempt = 1; attempt <= maxGenAttempts; attempt++) {
         pr.genAttempts = attempt;
         const cleanBuffer = stripMarkers(accumulated);
         // The lookahead. In the ablation there is none — and "(none — this is
@@ -3262,7 +3273,8 @@ export async function runIncrementalDraft(
   }, null, 2), "utf8");
 
   const dur = Date.now() - t0;
-  const ok = partsGenerated > 0 && finalCompileOk;
+  const ok = partsGenerated > 0 && finalCompileOk &&
+    (!suppliedPlan || partsGenerated === plan.length);
   log(`\n[inc-draft] done — ${partsGenerated}/${plan.length} parts built, ` +
       `${ok ? "ok" : "FAILED"} (${Math.round(dur / 1000)}s)`);
 

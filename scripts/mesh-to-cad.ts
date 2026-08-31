@@ -9,10 +9,10 @@ interface Args {
 
 function help(): never {
   console.log(`
-Mesh-to-CAD — private reference import and image-based part planning.
+Mesh-to-CAD — private reference import, image-based planning, and open-loop CAD generation.
 
 Usage:
-  bun run mesh-to-cad --mesh reference.stl -o outputs/reference-plan
+  bun run mesh-to-cad --mesh reference.stl -o outputs/reference-cad
 
 Options:
   --mesh PATH                 import STL, OBJ, PLY, GLB, glTF, or 3MF
@@ -40,8 +40,8 @@ function parse(argv: string[]): Args {
 }
 
 const args = parse(process.argv.slice(2));
-const { planReferenceRun } = await import("../src/pipeline/mesh-to-cad-plan.ts");
-const result = await planReferenceRun({
+const { runMeshToCadGeneration } = await import("../src/pipeline/mesh-to-cad-generation.ts");
+const result = await runMeshToCadGeneration({
   outputDir: args.outputDir,
   meshPath: args.meshPath,
   ...(args.referenceRoot ? { referenceRoot: args.referenceRoot } : {}),
@@ -50,3 +50,4 @@ const result = await planReferenceRun({
 console.log(`reference: ${result.reference.handle}`);
 console.log(`dimensions: ${result.summary.dimensions.join(" × ")} ${result.summary.units}`);
 console.log(`plan: ${result.plan.length} parts`);
+console.log(`final: ${result.outputDir}/final.scad ${result.outputDir}/final.obj`);

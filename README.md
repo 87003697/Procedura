@@ -125,27 +125,28 @@ bun run scripts/procedura.ts -o outputs/daybed \
 ### Mesh-to-CAD planning
 
 Import STL, OBJ, PLY, GLB, glTF, or 3MF into the private reference store
-and produce an upstream-compatible part plan without generating CAD. STL, OBJ,
-and PLY coordinates must already be Z-up millimetres; glTF/GLB use standard
-Y-up metres; 3MF uses its declared unit and defined coordinate transform:
+then use its single image and plan for open-loop CAD generation. STL, OBJ, and
+PLY coordinates must already be Z-up millimetres; glTF/GLB use standard Y-up
+metres; 3MF uses its declared unit and defined coordinate transform:
 
 ```bash
-bun run mesh-to-cad --mesh reference.stl -o outputs/reference-plan
+bun run mesh-to-cad --mesh reference.stl -o outputs/reference-cad
 ```
 
 Set `PROCEDURA_REFERENCE_ROOT` to a directory outside the Procedura checkout
-and outputs root. The trusted host renders one isometric `image.png` from the
-private geometry, then reuses Procedura's existing plan prompt, parser, retry,
-and review behavior to write `plan.json`. The model receives only that image
-and the bounded Z-up/mm geometry summary. It does not receive the reference
-handle, Mesh bytes, paths, materials, or textures. Canonical output remains
+and outputs root. Plan 2's planner receives only the single public `image.png`
+and bounded Z-up/mm geometry summary, and writes `plan.json`. Plan 3's
+incremental generator receives only that public `image.png` and `plan.json`.
+Neither call receives the reference handle, private canonical Mesh, source
+bytes or paths, manifest, materials, textures, or host metadata. The command
+retains `reference.json`, `image.png`, and `plan.json`, and adds `final.scad`
+and `final.obj` on success. Canonical output remains
 geometry-only binary STL in Z-up millimetres; STL/OBJ/PLY retain their
 preconditioned coordinates, while glTF/GLB convert Y-up/metres to
 Z-up/millimetres.
-
-That is text-only, part-by-part, with no image API and no Blender in the draft
-loop, and it is what you get with no flags at all. It is the cheapest useful
-configuration, not the strongest one.
+This is intentionally open-loop: no source-vs-generated comparison, refine or
+repair loop, closed-loop iteration, four-view/brief/scoring workflow,
+STEP/build123d, or material/texture processing.
 
 ### The best-quality run
 

@@ -35,6 +35,7 @@ export interface PlanReferenceRunOpts {
   meshPath: string;
   referenceRoot?: string;
   runsRoot?: string;
+  maxParts?: number;
 }
 
 async function generate(system: string, text: string, image: Uint8Array): Promise<string> {
@@ -82,7 +83,7 @@ export async function planReferenceRun(opts: PlanReferenceRunOpts): Promise<Plan
       image,
     );
     try {
-      plan = parsePlanJson(response, DEFAULT_MAX_PARTS);
+      plan = parsePlanJson(response, opts.maxParts ?? DEFAULT_MAX_PARTS);
       break;
     } catch (error) {
       parseError = (error as Error).message;
@@ -106,7 +107,7 @@ export async function planReferenceRun(opts: PlanReferenceRunOpts): Promise<Plan
     try {
       const review = parsePlanReview(
         await generate(PLAN_REVIEW_SYSTEM, reviewPrompt, image),
-        DEFAULT_MAX_PARTS,
+        opts.maxParts ?? DEFAULT_MAX_PARTS,
       );
       if (!review) break;
       if (review.plan) plan = mergeReviewedPlan(plan, review.plan).plan;

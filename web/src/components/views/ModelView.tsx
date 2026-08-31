@@ -17,16 +17,17 @@ type Mode = "reference" | "3d" | "painted" | "ao" | "pbr";
  * Everything else about the result lives in the inspector column.
  */
 export function ModelView({ run }: { run: RunDetail }) {
-  const mesh = meshPathOf(run.final) ?? meshPathOf(run.draft);
+  const finalMesh = meshPathOf(run.final);
+  const mesh = finalMesh ?? meshPathOf(run.draft);
   const painted = meshPathOf(run.painted);
   const hasAo = run.previewViews.length > 0;
   const hasPbr = run.previewPainted.length > 0;
-  const [mode, setMode] = useState<Mode>(painted ? "painted" : mesh ? "3d" : run.reference ? "reference" : hasPbr ? "pbr" : "ao");
+  const [mode, setMode] = useState<Mode>(painted ? "painted" : mesh ? "3d" : hasPbr ? "pbr" : "ao");
   const { v } = useMotion();
 
   const modes = [
-    ...(run.reference ? [{ value: "reference" as const, label: "Reference" }] : []),
-    ...(mesh ? [{ value: "3d" as const, label: "3D" }] : []),
+    ...(run.reference && finalMesh ? [{ value: "reference" as const, label: "Reference" }] : []),
+    ...(mesh ? [{ value: "3d" as const, label: run.reference && finalMesh ? "Generated" : "3D" }] : []),
     ...(painted ? [{ value: "painted" as const, label: "Painted" }] : []),
     ...(hasAo ? [{ value: "ao" as const, label: "Render" }] : []),
     ...(hasPbr ? [{ value: "pbr" as const, label: "PBR" }] : []),

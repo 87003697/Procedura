@@ -1,9 +1,10 @@
-# Patch Intent（README.md）：区分 Plan2/Plan3 输入与开放环边界。
 diff --git a/README.md b/README.md
-index 2ded0a3..3296a84 100644
+index 2ded0a3f4cea598ddf8d7dfd3fb461efb76a80b3..3296a84fed486fcbb652fb57ba025aad633eb0c8 100644
 --- a/README.md
 +++ b/README.md
-@@ -127,8 +127,8 @@ bun run scripts/procedura.ts -o outputs/daybed \
+@@ -125,27 +125,28 @@ bun run scripts/procedura.ts -o outputs/daybed \
+ ### Mesh-to-CAD planning
+ 
  Import STL, OBJ, PLY, GLB, glTF, or 3MF into the private reference store
 -and produce an upstream-compatible part plan without generating CAD. STL, OBJ,
 -and PLY coordinates must already be Z-up millimetres; glTF/GLB use standard
@@ -16,7 +17,7 @@ index 2ded0a3..3296a84 100644
 -bun run mesh-to-cad --mesh reference.stl -o outputs/reference-plan
 +bun run mesh-to-cad --mesh reference.stl -o outputs/reference-cad
  ```
-@@ -136,7 +136,9 @@ bun run mesh-to-cad --mesh reference.stl -o outputs/reference-plan
+ 
  Set `PROCEDURA_REFERENCE_ROOT` to a directory outside the Procedura checkout
 -and outputs root. The trusted host renders one isometric `image.png` from the
 -private geometry, then reuses Procedura's existing plan prompt, parser, retry,
@@ -31,7 +32,7 @@ index 2ded0a3..3296a84 100644
 +retains `reference.json`, `image.png`, and `plan.json`, and adds `final.scad`
 +and `final.obj` on success. Canonical output remains
  geometry-only binary STL in Z-up millimetres; STL/OBJ/PLY retain their
-@@ -144,6 +146,5 @@ preconditioned coordinates, while glTF/GLB convert Y-up/metres to
+ preconditioned coordinates, while glTF/GLB convert Y-up/metres to
  Z-up/millimetres.
 -
 -That is text-only, part-by-part, with no image API and no Blender in the draft
@@ -41,12 +42,15 @@ index 2ded0a3..3296a84 100644
 +repair loop, closed-loop iteration, four-view/brief/scoring workflow,
 +STEP/build123d, or material/texture processing.
  
-# Patch Intent（scripts/mesh-to-cad.ts）：CLI 委托完整生命周期。
+ ### The best-quality run
+ 
 diff --git a/scripts/mesh-to-cad.ts b/scripts/mesh-to-cad.ts
-index 6b5aa0c..0f5e7e2 100644
+index 6b5aa0cb6536daec73952cb552271b7e63fa62b5..542f0feca3b0cfd3f0980884f1c0c284d4b64336 100644
 --- a/scripts/mesh-to-cad.ts
 +++ b/scripts/mesh-to-cad.ts
-@@ -11,7 +11,7 @@ function help(): never {
+@@ -9,10 +9,10 @@ interface Args {
+ 
+ function help(): never {
    console.log(`
 -Mesh-to-CAD — private reference import and image-based part planning.
 +Mesh-to-CAD — private reference import, image-based planning, and open-loop CAD generation.
@@ -56,63 +60,68 @@ index 6b5aa0c..0f5e7e2 100644
 +  bun run mesh-to-cad --mesh reference.stl -o outputs/reference-cad
  
  Options:
-@@ -42,4 +42,4 @@ function parse(argv: string[]): Args {
+   --mesh PATH                 import STL, OBJ, PLY, GLB, glTF, or 3MF
+@@ -40,8 +40,8 @@ function parse(argv: string[]): Args {
+ }
+ 
  const args = parse(process.argv.slice(2));
 -const { planReferenceRun } = await import("../src/pipeline/mesh-to-cad-plan.ts");
 -const result = await planReferenceRun({
 +const { runMeshToCadGeneration } = await import("../src/pipeline/mesh-to-cad-generation.ts");
 +const result = await runMeshToCadGeneration({
    outputDir: args.outputDir,
-@@ -52 +52,2 @@ console.log(`dimensions: ${result.summary.dimensions.join(" × ")} ${result.summ
+   meshPath: args.meshPath,
+   ...(args.referenceRoot ? { referenceRoot: args.referenceRoot } : {}),
+@@ -50,3 +50,4 @@ const result = await planReferenceRun({
+ console.log(`reference: ${result.reference.handle}`);
+ console.log(`dimensions: ${result.summary.dimensions.join(" × ")} ${result.summary.units}`);
  console.log(`plan: ${result.plan.length} parts`);
 +console.log(`final: ${result.outputDir}/final.scad ${result.outputDir}/final.obj`);
-# Patch Intent（src/pipeline/mesh-to-cad-plan.ts）：仅 generation 使用的无 cap parser seam。
-diff --git a/src/pipeline/mesh-to-cad-plan.ts b/src/pipeline/mesh-to-cad-plan.ts
-index 36d6a58..abb02e7 100644
---- a/src/pipeline/mesh-to-cad-plan.ts
-+++ b/src/pipeline/mesh-to-cad-plan.ts
-@@ -37,2 +37,3 @@ export interface PlanReferenceRunOpts {
-   runsRoot?: string;
-+  maxParts?: number;
- }
-@@ -84,3 +85,3 @@ export async function planReferenceRun(opts: PlanReferenceRunOpts): Promise<Plan
-     try {
--      plan = parsePlanJson(response, DEFAULT_MAX_PARTS);
-+      plan = parsePlanJson(response, opts.maxParts ?? DEFAULT_MAX_PARTS);
-       break;
-@@ -108,3 +109,3 @@ export async function planReferenceRun(opts: PlanReferenceRunOpts): Promise<Plan
-         await generate(PLAN_REVIEW_SYSTEM, reviewPrompt, image),
--        DEFAULT_MAX_PARTS,
-+        opts.maxParts ?? DEFAULT_MAX_PARTS,
-       );
-# Patch Intent（src/pipeline/draft-incremental.ts）：inputPlan 严格开放环控制。
 diff --git a/src/pipeline/draft-incremental.ts b/src/pipeline/draft-incremental.ts
-index 906d0be..e021804 100644
+index 906d0be8dabba37cb3c315b64142702e27996a70..e021804c9c228448bb832def544a4bd8f3f5577f 100644
 --- a/src/pipeline/draft-incremental.ts
 +++ b/src/pipeline/draft-incremental.ts
-@@ -399,2 +399,4 @@ export interface IncrementalDraftOpts {
+@@ -397,6 +397,8 @@ export interface IncrementalDraftOpts {
+   /** When set, skip image-gen and use this image file as the reference (copied
+    * to <outputDir>/image.png). Mirrors runDraft's `inputImage`. */
    inputImage?: string;
 +  /** Host-produced plan.json; skips planner and reviewer when supplied. */
 +  inputPlan?: string;
    /**
-@@ -2176,3 +2178,5 @@ export async function runIncrementalDraft(
+    * Text-only mode: generate from the prompt with NO reference image at all.
+    *
+@@ -2174,7 +2176,9 @@ export async function runIncrementalDraft(
+   // wins and says so, rather than silently using the image it was told to skip.
+   const textOnly = opts.textOnly ?? false;
    const feedbackRenderSize = Number(process.env["PROCEDURA_FEEDBACK_RENDER_SIZE"] ?? "1024");
 -  const CONTEXT_VIEWS = resolveContextViews(opts.contextRenders ?? false);
 +  const inputPlan = opts.inputPlan;
 +  const suppliedPlan = inputPlan !== undefined;
 +  const CONTEXT_VIEWS = suppliedPlan ? [] : resolveContextViews(opts.contextRenders ?? false);
    // Assembly-aware incremental mode (Slice 1: mating-feature library + prompt).
-@@ -2190,3 +2194,3 @@ export async function runIncrementalDraft(
+   // Same opt-in-plus-kill-switch shape as motionAware; independent of it.
+   const assemblyAware = (opts.assemblyAware ?? false) &&
+@@ -2188,7 +2192,7 @@ export async function runIncrementalDraft(
+   // (the env form is what the benchmark rig sets, so an ablation arm is a config
+   // push and not a second code path). Off → every prompt and every call in this
    // file is byte-identical to the planned pipeline.
 -  const noPlan = (opts.noPlan ?? false) || process.env["PROCEDURA_NO_PLAN"] === "1";
 +  const noPlan = !suppliedPlan && ((opts.noPlan ?? false) || process.env["PROCEDURA_NO_PLAN"] === "1");
  
-@@ -2248,3 +2252,3 @@ export async function runIncrementalDraft(
+   // Trajectory: shared sink (unified pipeline) or a local file.
+   const trajectoryDir = join(outDir, "_trajectory");
+@@ -2246,7 +2250,7 @@ export async function runIncrementalDraft(
+   const planJsonPath = join(outDir, "plan.json");
+   // Resume a killed draft: reuse the plan + the parts already committed to
    // draft.scad, and continue from the first uncommitted part.
 -  const resuming = Boolean(opts.resume) && existsSync(planJsonPath) && existsSync(scadPath);
 +  const resuming = !suppliedPlan && Boolean(opts.resume) && existsSync(planJsonPath) && existsSync(scadPath);
    // Assembly-aware: inline the mating-feature helper library into the seed so
-@@ -2377,3 +2381,9 @@ export async function runIncrementalDraft(
+   // both mating parts call identical helpers (fit by construction) and every
+   // derived compile stays self-contained. On RESUME the committed draft.scad
+@@ -2375,7 +2379,13 @@ export async function runIncrementalDraft(
+     };
+ 
      // ── Stage B: plan ───────────────────────────────────────────────────
 -    if (!noPlan) {
 +    if (inputPlan !== undefined && !resuming) {
@@ -123,83 +132,145 @@ index 906d0be..e021804 100644
 +      emit("draft.plan.ready", { partCount: plan.length, source: "provided" });
 +    } else if (!noPlan) {
        log(`[inc-draft] planning parts`);
-@@ -2405,3 +2415,3 @@ export async function runIncrementalDraft(
+       emit("draft.plan.requested");
+     }
+@@ -2403,7 +2413,7 @@ export async function runIncrementalDraft(
+       // killed run still leaves the parts it decided on, in order.
+       if (!resuming) writeFileSync(planJsonPath, "[]", "utf8");
      }
 -    if (!noPlan && !resuming) {
 +    if (!noPlan && !suppliedPlan && !resuming) {
        let planErr: string | null = null;
-@@ -2457,3 +2467,3 @@ export async function runIncrementalDraft(
+       for (let attempt = 1; attempt <= PLAN_MAX_ATTEMPTS; attempt++) {
+         const planUserText =
+@@ -2455,7 +2465,7 @@ export async function runIncrementalDraft(
+     // stops reviewing and proceeds with the best plan so far (never kills the
+     // run). Set PROCEDURA_PLAN_REVIEW_ITERS=0 to disable.
      const planReviewIters = opts.planReviewIters ?? DEFAULT_PLAN_REVIEW_ITERS;
 -    if (!noPlan && !resuming && planReviewIters > 0) {
 +    if (!noPlan && !suppliedPlan && !resuming && planReviewIters > 0) {
        const planReviewSystem = readFileSync(PLAN_REVIEW_SYSTEM_PATH, "utf8") +
-@@ -2537,3 +2547,3 @@ export async function runIncrementalDraft(
+         planMotionAddendum + planAssemblyAddendum +
+         (motionAware ? "\n\n" + PLAN_REVIEW_MOTION_NOTE : "") +
+@@ -2535,12 +2545,12 @@ export async function runIncrementalDraft(
+     let floatersBefore = 0;
+     // Gate is on by default; set PROCEDURA_INCREMENTAL_CONN_GATE=0 to reproduce the
      // pre-gate baseline (commit every part unconditionally, no connectivity check).
 -    const connGateEnabled = (process.env["PROCEDURA_INCREMENTAL_CONN_GATE"] ?? "1") !== "0";
 +    const connGateEnabled = !suppliedPlan && (process.env["PROCEDURA_INCREMENTAL_CONN_GATE"] ?? "1") !== "0";
      log(`[inc-draft] per-part connectivity gate: ${connGateEnabled ? "ON" : "OFF"}`);
-@@ -2542,3 +2552,3 @@ export async function runIncrementalDraft(
+     log(`[inc-draft] 3D feedback per part: ${CONTEXT_VIEWS.length ? CONTEXT_VIEWS.join(", ") : "OFF"}`);
+     // Opt-in motion gate (pre-commit parent-attachment / non-parent-fusion
      // check on MOVING parts); default OFF — set PROCEDURA_INCREMENTAL_MOTION_GATE=1.
 -    const motionGateEnabled =
 +    const motionGateEnabled = !suppliedPlan &&
        motionAware && process.env["PROCEDURA_INCREMENTAL_MOTION_GATE"] === "1";
-@@ -2550,3 +2560,3 @@ export async function runIncrementalDraft(
+     if (motionAware) {
+       log(`[inc-draft] motion-aware incremental: ON (sidecar → ${INCREMENTAL_MOTION_FILE}); ` +
+@@ -2548,18 +2558,19 @@ export async function runIncrementalDraft(
+     }
+     // Opt-in pre-commit assembly gate (contact + interpenetration on parts with a
      // declared partner); default OFF — set PROCEDURA_INCREMENTAL_ASSEMBLY_GATE=1.
 -    const assemblyGateEnabled =
 +    const assemblyGateEnabled = !suppliedPlan &&
        assemblyAware && process.env["PROCEDURA_INCREMENTAL_ASSEMBLY_GATE"] === "1";
-@@ -2556,3 +2566,3 @@ export async function runIncrementalDraft(
+     // ── Profiling escape hatches. Both DEGRADE the build; they exist to
+     // measure the floor cost of gen + split + render, not to ship with. ──
+     // Skips every mate measurement, including the floater-override path that
      // rescues a correctly-seated clearance fit — so more parts read as floaters.
 -    const skipMateCheck = process.env["PROCEDURA_SKIP_MATE_CHECK"] === "1";
 +    const skipMateCheck = !suppliedPlan && process.env["PROCEDURA_SKIP_MATE_CHECK"] === "1";
      // Skips the per-part whole-assembly compile. That compile is ALSO how a
-@@ -2561,3 +2571,4 @@ export async function runIncrementalDraft(
+     // broken part is detected: without it there is no compile error to retry
+     // on, no connectivity gate, and no build-so-far mesh, so parts commit
      // unvalidated and the draft can end up structurally wrong.
 -    const skipPartCompile = process.env["PROCEDURA_SKIP_PART_COMPILE"] === "1";
 +    const skipPartCompile = !suppliedPlan && process.env["PROCEDURA_SKIP_PART_COMPILE"] === "1";
 +    const maxGenAttempts = suppliedPlan ? 1 : GEN_MAX_ATTEMPTS;
      if (skipMateCheck || skipPartCompile) {
-@@ -2770,3 +2781,3 @@ export async function runIncrementalDraft(
+       log(`  WARNING: profiling flags active — ` +
+           `${skipPartCompile ? "per-part compile+gate OFF " : ""}` +
+@@ -2768,7 +2779,7 @@ export async function runIncrementalDraft(
+       // read for retry feedback.)
+       let lastFailure: { kind: "compile" | "floater" | "motion" | "assembly"; detail: string } | null = null;
        let placedThisPart: string | null = null;
 -      for (let attempt = 1; attempt <= GEN_MAX_ATTEMPTS; attempt++) {
 +      for (let attempt = 1; attempt <= maxGenAttempts; attempt++) {
          pr.genAttempts = attempt;
-@@ -3264,3 +3275,4 @@ export async function runIncrementalDraft(
+         const cleanBuffer = stripMarkers(accumulated);
+         // The lookahead. In the ablation there is none — and "(none — this is
+@@ -3262,7 +3273,8 @@ export async function runIncrementalDraft(
+   }, null, 2), "utf8");
+ 
    const dur = Date.now() - t0;
 -  const ok = partsGenerated > 0 && finalCompileOk;
 +  const ok = partsGenerated > 0 && finalCompileOk &&
 +    (!suppliedPlan || partsGenerated === plan.length);
    log(`\n[inc-draft] done — ${partsGenerated}/${plan.length} parts built, ` +
-# Patch Intent（web/src/components/views/ModelView.tsx）：final-only pair 与 draft 3D fallback。
+       `${ok ? "ok" : "FAILED"} (${Math.round(dur / 1000)}s)`);
+ 
+diff --git a/src/pipeline/mesh-to-cad-plan.ts b/src/pipeline/mesh-to-cad-plan.ts
+index 36d6a58229d733604a58f5575be17d770f64e9d9..abb02e7af524043f722694edd3a16d4a2a5575d1 100644
+--- a/src/pipeline/mesh-to-cad-plan.ts
++++ b/src/pipeline/mesh-to-cad-plan.ts
+@@ -35,6 +35,7 @@ export interface PlanReferenceRunOpts {
+   meshPath: string;
+   referenceRoot?: string;
+   runsRoot?: string;
++  maxParts?: number;
+ }
+ 
+ async function generate(system: string, text: string, image: Uint8Array): Promise<string> {
+@@ -82,7 +83,7 @@ export async function planReferenceRun(opts: PlanReferenceRunOpts): Promise<Plan
+       image,
+     );
+     try {
+-      plan = parsePlanJson(response, DEFAULT_MAX_PARTS);
++      plan = parsePlanJson(response, opts.maxParts ?? DEFAULT_MAX_PARTS);
+       break;
+     } catch (error) {
+       parseError = (error as Error).message;
+@@ -106,7 +107,7 @@ export async function planReferenceRun(opts: PlanReferenceRunOpts): Promise<Plan
+     try {
+       const review = parsePlanReview(
+         await generate(PLAN_REVIEW_SYSTEM, reviewPrompt, image),
+-        DEFAULT_MAX_PARTS,
++        opts.maxParts ?? DEFAULT_MAX_PARTS,
+       );
+       if (!review) break;
+       if (review.plan) plan = mergeReviewedPlan(plan, review.plan).plan;
 diff --git a/web/src/components/views/ModelView.tsx b/web/src/components/views/ModelView.tsx
-index fe29af6..f05a484 100644
+index fe29af604ed9289b73e401917bd1f10cca088e21..f05a48471561a6f2be98c895eef842359ca3b646 100644
 --- a/web/src/components/views/ModelView.tsx
 +++ b/web/src/components/views/ModelView.tsx
-@@ -19,3 +19,4 @@ type Mode = "reference" | "3d" | "painted" | "ao" | "pbr";
+@@ -17,16 +17,17 @@ type Mode = "reference" | "3d" | "painted" | "ao" | "pbr";
+  * Everything else about the result lives in the inspector column.
+  */
  export function ModelView({ run }: { run: RunDetail }) {
 -  const mesh = meshPathOf(run.final) ?? meshPathOf(run.draft);
 +  const finalMesh = meshPathOf(run.final);
 +  const mesh = finalMesh ?? meshPathOf(run.draft);
    const painted = meshPathOf(run.painted);
-@@ -23,3 +24,3 @@ export function ModelView({ run }: { run: RunDetail }) {
+   const hasAo = run.previewViews.length > 0;
    const hasPbr = run.previewPainted.length > 0;
 -  const [mode, setMode] = useState<Mode>(painted ? "painted" : mesh ? "3d" : run.reference ? "reference" : hasPbr ? "pbr" : "ao");
 +  const [mode, setMode] = useState<Mode>(painted ? "painted" : mesh ? "3d" : hasPbr ? "pbr" : "ao");
    const { v } = useMotion();
-@@ -27,4 +28,4 @@ export function ModelView({ run }: { run: RunDetail }) {
+ 
    const modes = [
 -    ...(run.reference ? [{ value: "reference" as const, label: "Reference" }] : []),
 -    ...(mesh ? [{ value: "3d" as const, label: "3D" }] : []),
 +    ...(run.reference && finalMesh ? [{ value: "reference" as const, label: "Reference" }] : []),
 +    ...(mesh ? [{ value: "3d" as const, label: run.reference && finalMesh ? "Generated" : "3D" }] : []),
      ...(painted ? [{ value: "painted" as const, label: "Painted" }] : []),
-# Patch Intent（src/pipeline/mesh-to-cad-generation.ts）：安全清理后直接增量生成并晋级 final。
+     ...(hasAo ? [{ value: "ao" as const, label: "Render" }] : []),
+     ...(hasPbr ? [{ value: "pbr" as const, label: "PBR" }] : []),
 diff --git a/src/pipeline/mesh-to-cad-generation.ts b/src/pipeline/mesh-to-cad-generation.ts
 new file mode 100644
-index 0000000..dc9d58d
+index 0000000000000000000000000000000000000000..b25d144076b0427b75429029b1adf5a5b202b562
 --- /dev/null
 +++ b/src/pipeline/mesh-to-cad-generation.ts
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,75 @@
 +import { copyFileSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 +import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 +import { runIncrementalDraft, parsePlanJson } from "./draft-incremental.ts";
@@ -261,11 +332,17 @@ index 0000000..dc9d58d
 +  }
 +  const finalScad = resolve(outputDir, "final.scad");
 +  const finalObj = resolve(outputDir, "final.obj");
-+  copyFileSync(draft.scadPath, finalScad);
-+  copyFileSync(draftObj, finalObj);
-+  writeFileSync(resolve(outputDir, "final_summary.txt"), "verdict: ok\n\nsummary:\nopen-loop incremental draft promoted without refinement.\n", "utf8");
-+  if (statSync(finalScad).size === 0 || statSync(finalObj).size === 0) {
-+    throw new Error("Mesh-to-CAD generation produced empty final artifacts");
++  const finalSummary = resolve(outputDir, "final_summary.txt");
++  try {
++    copyFileSync(draft.scadPath, finalScad);
++    copyFileSync(draftObj, finalObj);
++    writeFileSync(finalSummary, "verdict: ok\n\nsummary:\nopen-loop incremental draft promoted without refinement.\n", "utf8");
++    if (statSync(finalScad).size === 0 || statSync(finalObj).size === 0) {
++      throw new Error("Mesh-to-CAD generation produced empty final artifacts");
++    }
++  } catch (error) {
++    for (const path of [finalScad, finalObj, finalSummary]) rmSync(path, { force: true });
++    throw error;
 +  }
 +  return planned;
 +}
