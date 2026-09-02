@@ -1,0 +1,803 @@
+diff --git a/scripts/mesh-to-cad.ts b/scripts/mesh-to-cad.ts
+index ee7d49a..73c7a71 100644
+--- a/scripts/mesh-to-cad.ts
++++ b/scripts/mesh-to-cad.ts
+@@ -43,7 +43,7 @@ function parse(argv: string[]): Args {
+ }
+ 
+ const args = parse(process.argv.slice(2));
+-const { runMeshToCadGeneration } = await import("../src/pipeline/mesh-to-cad-generation.ts");
++const { runMeshToCadGeneration } = await import("../src/pipeline_mesh2code/mesh-to-cad-generation.ts");
+ const result = await runMeshToCadGeneration({
+   outputDir: args.outputDir,
+   meshPath: args.meshPath,
+diff --git a/src/pipeline/mesh-to-cad-generation.ts b/src/pipeline/mesh-to-cad-generation.ts
+deleted file mode 100644
+index 803fe98..0000000
+--- a/src/pipeline/mesh-to-cad-generation.ts
++++ /dev/null
+@@ -1,80 +0,0 @@
+-import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
+-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+-import {
+-  planReferenceRun,
+-  type PlanReferenceRunOpts,
+-  type PlanReferenceRunResult,
+-} from "./mesh-to-cad-plan.ts";
+-import { runProcedura } from "./procedura.ts";
+-import type { ViewName } from "../render/views.ts";
+-
+-const PROCEDURA_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..", "..");
+-const STALE_FILES = [
+-  "final.scad", "final.obj", "final.stl", "final.mtl", "final_summary.txt",
+-  "final_painted.scad", "final_painted.stl", "final_painted.obj", "final_painted.mtl",
+-  "final_materials.json", "final_palette.json", "ortho_reviewed.scad",
+-  "ortho_reviewed.obj", "ortho_reviewed.stl", "ortho_reviewed.mtl", "ortho_review_summary.txt",
+-];
+-const STALE_DIRS = [
+-  "preview_final", "preview_painted", "preview_ao", "preview_ao_ortho",
+-  "preview_final.tmp", "_final_build", "_refine_steps", "motion",
+-];
+-const REFINE_REFERENCE_VIEWS = [
+-  "isometric", "front", "back", "left", "right", "top", "bottom",
+-] as const satisfies readonly ViewName[];
+-
+-function isInside(path: string, root: string): boolean {
+-  const rel = relative(root, path);
+-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+-}
+-
+-export async function runMeshToCadGeneration(
+-  opts: PlanReferenceRunOpts & { refine?: boolean },
+-): Promise<PlanReferenceRunResult> {
+-  const { refine = false, ...planOpts } = opts;
+-  const outputDir = resolve(opts.outputDir);
+-  if (existsSync(outputDir) && !statSync(outputDir).isDirectory()) {
+-    throw new Error("outputDir must be a directory");
+-  }
+-  const runsRoot = resolve(
+-    opts.runsRoot ?? process.env["PROCEDURA_OUTPUTS_ROOT"] ?? join(PROCEDURA_ROOT, "outputs"),
+-  );
+-  if (!isInside(outputDir, runsRoot)) throw new Error("outputDir must be inside runsRoot");
+-  for (const file of STALE_FILES) rmSync(resolve(outputDir, file), { force: true });
+-  for (const dir of STALE_DIRS) rmSync(resolve(outputDir, dir), { recursive: true, force: true });
+-  const planned = await planReferenceRun({
+-    ...planOpts,
+-    ...(refine ? { referenceViews: REFINE_REFERENCE_VIEWS } : {}),
+-    maxParts: 0,
+-  });
+-  const imagePath = resolve(planned.outputDir, "image.png");
+-  const planPath = resolve(planned.outputDir, "plan.json");
+-  if (!existsSync(imagePath) || !existsSync(planPath)) {
+-    throw new Error("Mesh-to-CAD generation requires Plan 2 image.png and plan.json");
+-  }
+-  const planText = readFileSync(planPath, "utf8");
+-  const generated = await runProcedura({
+-    text: "Generate editable CAD from this host-produced plan:\n\n" + planText,
+-    outputDir: planned.outputDir,
+-    incremental: true,
+-    inputImages: planned.referenceImages.map((image) => ({
+-      label: image.view,
+-      path: image.path,
+-    })),
+-    inputPlan: planPath,
+-    redo: true,
+-    refine,
+-    refineMode: "direct",
+-    draftPromotion: "open-loop",
+-  });
+-  const finalScad = resolve(outputDir, "final.scad");
+-  const finalObj = resolve(outputDir, "final.obj");
+-  if (!generated.refine.ok) {
+-    throw new Error(`Mesh-to-CAD refine ended with verdict: ${generated.refine.verdict}`);
+-  }
+-  if (!existsSync(finalScad) || !existsSync(finalObj) ||
+-    statSync(finalScad).size === 0 || statSync(finalObj).size === 0) {
+-    throw new Error("Mesh-to-CAD generation did not produce complete final artifacts");
+-  }
+-  return planned;
+-}
+diff --git a/src/pipeline/mesh-to-cad-plan.ts b/src/pipeline/mesh-to-cad-plan.ts
+deleted file mode 100644
+index 8369b69..0000000
+--- a/src/pipeline/mesh-to-cad-plan.ts
++++ /dev/null
+@@ -1,154 +0,0 @@
+-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+-import { dirname, join, resolve } from "node:path";
+-import { Buffer } from "node:buffer";
+-
+-import type { CanonicalPart } from "@harness/template/llm/protocol";
+-
+-import { DEFAULT_MODEL, resolveModel } from "../config/models.ts";
+-import { generateOnce } from "../llm/generate.ts";
+-import { routeForModel } from "../llm/routes.ts";
+-import {
+-  DEFAULT_MAX_PARTS,
+-  DEFAULT_PLAN_REVIEW_ITERS,
+-  PLAN_MAX_ATTEMPTS,
+-  mergeReviewedPlan,
+-  parsePlanJson,
+-  parsePlanReview,
+-  type PartPlanItem,
+-} from "./draft-incremental.ts";
+-import {
+-  importReferenceRun,
+-  type ImportReferenceRunResult,
+-} from "./mesh-to-cad-reference.ts";
+-import { ReferenceAuthority } from "../reference/authority.ts";
+-import { ALL_VIEW_NAMES, type ViewName } from "../render/views.ts";
+-
+-const PROCEDURA_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..", "..");
+-const PLAN_SYSTEM = readFileSync(join(PROCEDURA_ROOT, "prompts", "plan_system.md"), "utf8");
+-const PLAN_REVIEW_SYSTEM = readFileSync(join(PROCEDURA_ROOT, "prompts", "plan_review_system.md"), "utf8");
+-const DEFAULT_REFERENCE_VIEWS = ["isometric"] as const;
+-
+-export interface PlanReferenceRunResult extends ImportReferenceRunResult {
+-  plan: PartPlanItem[];
+-  referenceImages: Array<{ view: ViewName; path: string }>;
+-}
+-
+-export interface PlanReferenceRunOpts {
+-  outputDir: string;
+-  meshPath: string;
+-  referenceRoot?: string;
+-  runsRoot?: string;
+-  maxParts?: number;
+-  /** Ordered render views. The first view is the authoritative image.png. */
+-  referenceViews?: readonly ViewName[];
+-}
+-
+-async function generate(
+-  system: string,
+-  text: string,
+-  images: readonly { view: ViewName; bytes: Uint8Array }[],
+-): Promise<string> {
+-  const model = resolveModel(DEFAULT_MODEL);
+-  const parts: CanonicalPart[] = [{ kind: "text", text }];
+-  images.forEach((image, index) => {
+-    parts.push({
+-      kind: "text",
+-      text: index === 0
+-        ? `View 1 (${image.view}, primary):`
+-        : `View ${index + 1} (${image.view}, supplementary):`,
+-    });
+-    parts.push({
+-      kind: "image",
+-      data: Buffer.from(image.bytes).toString("base64"),
+-      mimeType: "image/png",
+-    });
+-  });
+-  const result = await generateOnce({
+-    route: routeForModel(DEFAULT_MODEL),
+-    model,
+-    system,
+-    parts,
+-  });
+-  return result.text;
+-}
+-
+-export async function planReferenceRun(opts: PlanReferenceRunOpts): Promise<PlanReferenceRunResult> {
+-  const imported = await importReferenceRun(opts);
+-  const runsRoot = resolve(
+-    opts.runsRoot ?? process.env["PROCEDURA_OUTPUTS_ROOT"] ?? join(PROCEDURA_ROOT, "outputs"),
+-  );
+-  const configuredRoot = opts.referenceRoot ?? process.env["PROCEDURA_REFERENCE_ROOT"];
+-  if (!configuredRoot) throw new Error("Mesh-to-CAD requires --reference-root or PROCEDURA_REFERENCE_ROOT");
+-  const authority = new ReferenceAuthority(resolve(configuredRoot), [runsRoot, PROCEDURA_ROOT]);
+-  for (const view of ALL_VIEW_NAMES) {
+-    rmSync(join(imported.outputDir, `image-${view}.png`), { force: true });
+-  }
+-  const images = await authority.renderReferenceImages(
+-    imported.reference.handle,
+-    opts.referenceViews ?? DEFAULT_REFERENCE_VIEWS,
+-  );
+-  const referenceImages = images.map((image, index) => {
+-    const path = join(
+-      imported.outputDir,
+-      index === 0 ? "image.png" : `image-${image.view}.png`,
+-    );
+-    writeFileSync(path, image.bytes);
+-    return { view: image.view, path };
+-  });
+-
+-  const summary = JSON.stringify(imported.summary);
+-  const planPrompt =
+-    "Object to decompose:\n\n" +
+-    "=== TEXT DESCRIPTION ===\nNo text description was provided. Use the reference views.\n\n" +
+-    `=== HOST GEOMETRY SUMMARY ===\n${summary}\n\n` +
+-    "=== REFERENCE VIEWS ===\nView 1 is authoritative; later views are supplementary.\n\n";
+-
+-  let plan: PartPlanItem[] = [];
+-  let parseError = "unparseable response";
+-  for (let attempt = 1; attempt <= PLAN_MAX_ATTEMPTS; attempt++) {
+-    const retryNote = attempt > 1
+-      ? `Your previous reply could not be parsed (${parseError}). `
+-      : "";
+-    const response = await generate(
+-      PLAN_SYSTEM,
+-      planPrompt + retryNote + "Produce the ordered JSON build plan now. Return ONLY the JSON array.",
+-      images,
+-    );
+-    try {
+-      plan = parsePlanJson(response, opts.maxParts ?? DEFAULT_MAX_PARTS);
+-      break;
+-    } catch (error) {
+-      parseError = (error as Error).message;
+-    }
+-  }
+-  if (plan.length === 0) throw new Error(`planning failed: ${parseError}`);
+-
+-  for (let iteration = 0; iteration < DEFAULT_PLAN_REVIEW_ITERS; iteration++) {
+-    const listed = plan
+-      .map((part, index) => `${index + 1}. ${part.name} (${part.level ?? "L?"}): ${part.description}`)
+-      .join("\n");
+-    const reviewPrompt =
+-      "Review this build plan against the reference views and text. " +
+-      "ADD-AND-SHARPEN ONLY: add genuinely missing parts and sharpen vague " +
+-      "descriptions — never merge, remove, rename, or reorder the planned " +
+-      "parts, and keep the planner's left/right assignments.\n\n" +
+-      "=== TEXT DESCRIPTION ===\nNo text description was provided. Use the reference views.\n\n" +
+-      `=== HOST GEOMETRY SUMMARY ===\n${summary}\n\n` +
+-      `=== CURRENT PLAN (${plan.length} parts) ===\n${listed}\n\n` +
+-      "Return ONLY the JSON object {ok, notes, plan}.";
+-    try {
+-      const review = parsePlanReview(
+-        await generate(PLAN_REVIEW_SYSTEM, reviewPrompt, images),
+-        opts.maxParts ?? DEFAULT_MAX_PARTS,
+-      );
+-      if (!review) break;
+-      if (review.plan) plan = mergeReviewedPlan(plan, review.plan).plan;
+-      if (review.ok) break;
+-    } catch {
+-      break;
+-    }
+-  }
+-
+-  writeFileSync(join(imported.outputDir, "plan.json"), JSON.stringify(plan, null, 2), "utf8");
+-  return { ...imported, plan, referenceImages };
+-}
+diff --git a/src/pipeline/mesh-to-cad-reference.ts b/src/pipeline/mesh-to-cad-reference.ts
+deleted file mode 100644
+index 7acadb7..0000000
+--- a/src/pipeline/mesh-to-cad-reference.ts
++++ /dev/null
+@@ -1,86 +0,0 @@
+-import {
+-  existsSync,
+-  mkdirSync,
+-  mkdtempSync,
+-  renameSync,
+-  rmSync,
+-  statSync,
+-  writeFileSync,
+-} from "node:fs";
+-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+-import { randomUUID } from "node:crypto";
+-
+-import {
+-  ReferenceAuthority,
+-  type ReferenceDescriptor,
+-  type ReferenceSummary,
+-} from "../reference/authority.ts";
+-
+-const PROCEDURA_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..", "..");
+-
+-export interface ImportReferenceRunOpts {
+-  outputDir: string;
+-  meshPath?: string;
+-  referenceHandle?: string;
+-  referenceRoot?: string;
+-  runsRoot?: string;
+-}
+-
+-export interface ImportReferenceRunResult {
+-  outputDir: string;
+-  reference: ReferenceDescriptor;
+-  summary: ReferenceSummary;
+-}
+-
+-function isInside(path: string, root: string): boolean {
+-  const rel = relative(root, path);
+-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+-}
+-
+-export async function importReferenceRun(opts: ImportReferenceRunOpts): Promise<ImportReferenceRunResult> {
+-  if (Boolean(opts.meshPath) === Boolean(opts.referenceHandle)) {
+-    throw new Error("importReferenceRun requires exactly one of meshPath or referenceHandle");
+-  }
+-  const outputDir = resolve(opts.outputDir);
+-  if (existsSync(outputDir) && !statSync(outputDir).isDirectory()) {
+-    throw new Error("outputDir must be a directory");
+-  }
+-  const runsRoot = resolve(opts.runsRoot ?? process.env["PROCEDURA_OUTPUTS_ROOT"] ?? join(PROCEDURA_ROOT, "outputs"));
+-  if (!isInside(outputDir, runsRoot)) throw new Error("outputDir must be inside runsRoot");
+-  const configuredRoot = opts.referenceRoot ?? process.env["PROCEDURA_REFERENCE_ROOT"];
+-  if (!configuredRoot) throw new Error("Mesh-to-CAD requires --reference-root or PROCEDURA_REFERENCE_ROOT");
+-  const authority = new ReferenceAuthority(resolve(configuredRoot), [runsRoot, PROCEDURA_ROOT]);
+-  let created = false;
+-  let createdHandle: string | null = null;
+-  const outputExisted = existsSync(outputDir);
+-  if (!outputExisted) mkdirSync(dirname(outputDir), { recursive: true });
+-  const stagingDir = outputExisted
+-    ? outputDir
+-    : mkdtempSync(join(dirname(outputDir), "." + randomUUID() + ".reference-import-"));
+-  const descriptorPath = outputExisted
+-    ? join(outputDir, ".reference-" + randomUUID() + ".json")
+-    : join(stagingDir, "reference.json");
+-  try {
+-    const reference = opts.meshPath
+-      ? await authority.importReference(opts.meshPath)
+-      : { handle: opts.referenceHandle! };
+-    created = Boolean(opts.meshPath);
+-    createdHandle = created ? reference.handle : null;
+-    const summary = authority.inspectReferenceSummary(reference.handle);
+-    if (!outputExisted) mkdirSync(stagingDir, { recursive: true });
+-    writeFileSync(descriptorPath, JSON.stringify({
+-      schemaVersion: 1,
+-      handle: reference.handle,
+-      format: "stl",
+-      summary,
+-    }, null, 2), "utf8");
+-    if (!outputExisted) renameSync(stagingDir, outputDir);
+-    else renameSync(descriptorPath, join(outputDir, "reference.json"));
+-    return { outputDir, reference, summary };
+-  } catch (error) {
+-    if (createdHandle) authority.discardReference(createdHandle);
+-    if (!outputExisted) rmSync(stagingDir, { recursive: true, force: true });
+-    else rmSync(descriptorPath, { force: true });
+-    throw error;
+-  }
+-}
+diff --git a/src/pipeline/procedura.ts b/src/pipeline/procedura.ts
+index c165cd7..7813220 100644
+--- a/src/pipeline/procedura.ts
++++ b/src/pipeline/procedura.ts
+@@ -53,11 +53,13 @@ export interface RunProceduraOpts {
+   /** When set, skip image-gen in the draft phase and use this image file as
+    *  the reference (copied to <outputDir>/image.png). SCAD-gen still runs. */
+   inputImage?: string;
+-  /** Ordered provided views for incremental draft. The first is authoritative.
+-   * The same set is reused by direct whole-model refine when enabled. */
+-  inputImages?: readonly { label: string; path: string }[];
+-  /** Host-produced plan.json for incremental draft; skips internal planning. */
+-  inputPlan?: string;
++  /** Optional host-controlled execution context. Ordinary callers omit it. */
++  externalExecution?: {
++    inputImages?: readonly { label: string; path: string }[];
++    inputPlan?: string;
++    refineMode?: "direct" | "agent";
++    draftPromotion?: "standard" | "open-loop";
++  };
+   /** Text-only: generate with NO reference image at all. Skips image-gen in the
+    *  draft; refine and paint follow automatically by detecting the absent
+    *  image.png. Incremental draft only — `runDraft` still needs an image. */
+@@ -119,10 +121,6 @@ export interface RunProceduraOpts {
+    * the final model: draft.{scad,stl,obj} are promoted to final.* and a
+    * synthetic verdict="skipped" RefineResult is returned (no refine loop). */
+   refine?: boolean;
+-  /** Select the Phase 2 implementation. Defaults to PROCEDURA_REFINE_MODE, then direct. */
+-  refineMode?: "direct" | "agent";
+-  /** Promotion profile when refine is disabled. Default preserves normal Procedura artifacts. */
+-  draftPromotion?: "standard" | "open-loop";
+   /** Persist the binary STL deliverable (draft.stl / final.stl) alongside the
+    * OBJ. Default false — only the normalized OBJ (+ SCAD) is exported; STL is
+    * kept in internal build dirs for connectivity/rendering. */
+@@ -303,12 +301,12 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
+           outputDir: outDir,
+           ...(opts.scadModel !== undefined ? { scadModel: opts.scadModel } : {}),
+           ...(opts.imageModel !== undefined ? { imageModel: opts.imageModel } : {}),
+-          ...(opts.inputImages !== undefined
+-            ? { inputImages: opts.inputImages }
++          ...(opts.externalExecution?.inputImages !== undefined
++            ? { inputImages: opts.externalExecution.inputImages }
+             : opts.inputImage !== undefined
+               ? { inputImages: [{ label: "primary", path: opts.inputImage }] }
+               : {}),
+-          ...(opts.inputPlan !== undefined ? { inputPlan: opts.inputPlan } : {}),
++          ...(opts.externalExecution?.inputPlan !== undefined ? { inputPlan: opts.externalExecution.inputPlan } : {}),
+           ...(opts.textOnly ? { textOnly: true } : {}),
+           ...(opts.contextRenders ? { contextRenders: true } : {}),
+           ...(opts.extraRefs !== undefined ? { extraRefs: opts.extraRefs } : {}),
+@@ -350,14 +348,15 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
+     if (opts.refine === false) {
+       console.log(`\n--- Phase 2: refine SKIPPED (--no-refine) — promoting draft → final ---`);
+       refineResult = await promoteDraftAsFinal(
+-        outDir, writer.path, exportStl, opts.draftPromotion ?? "standard",
++        outDir, writer.path, exportStl,
++        opts.externalExecution?.draftPromotion ?? "standard",
+       );
+     } else {
+       // Refine implementation. `direct` (the default) runs the fixed
+       // context → critic → measure → patch → gate cycle as a pipeline; `agent`
+       // is the historical seventeen-tool loop, kept for A/B until the benchmark
+       // has ruled on the swap. PROCEDURA_REFINE_MODE=agent restores it.
+-      const refineMode = opts.refineMode
++      const refineMode = opts.externalExecution?.refineMode
+         ?? (process.env["PROCEDURA_REFINE_MODE"] === "agent" ? "agent" : "direct");
+       console.log(`\n--- Phase 2: refine (${refineMode}) ---`);
+       const refineOpts = {
+@@ -373,7 +372,7 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
+         ? await runRefine(refineOpts)
+         : await runDirectRefine({
+             ...refineOpts,
+-            ...(opts.inputImages !== undefined ? { referenceImages: opts.inputImages } : {}),
++            ...(opts.externalExecution?.inputImages !== undefined ? { referenceImages: opts.externalExecution.inputImages } : {}),
+           });
+     }
+ 
+diff --git a/src/pipeline_mesh2code/mesh-to-cad-generation.ts b/src/pipeline_mesh2code/mesh-to-cad-generation.ts
+new file mode 100644
+index 0000000..ff6b3da
+--- /dev/null
++++ b/src/pipeline_mesh2code/mesh-to-cad-generation.ts
+@@ -0,0 +1,76 @@
++import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
++import { dirname, isAbsolute, join, relative, resolve } from "node:path";
++import {
++  planReferenceRun,
++  type PlanReferenceRunOpts,
++  type PlanReferenceRunResult,
++} from "./mesh-to-cad-plan.ts";
++import { runMeshToCadProcedura } from "./procedura_adapter.ts";
++import type { ViewName } from "../render/views.ts";
++
++const PROCEDURA_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..", "..");
++const STALE_FILES = [
++  "final.scad", "final.obj", "final.stl", "final.mtl", "final_summary.txt",
++  "final_painted.scad", "final_painted.stl", "final_painted.obj", "final_painted.mtl",
++  "final_materials.json", "final_palette.json", "ortho_reviewed.scad",
++  "ortho_reviewed.obj", "ortho_reviewed.stl", "ortho_reviewed.mtl", "ortho_review_summary.txt",
++];
++const STALE_DIRS = [
++  "preview_final", "preview_painted", "preview_ao", "preview_ao_ortho",
++  "preview_final.tmp", "_final_build", "_refine_steps", "motion",
++];
++const REFINE_REFERENCE_VIEWS = [
++  "isometric", "front", "back", "left", "right", "top", "bottom",
++] as const satisfies readonly ViewName[];
++
++function isInside(path: string, root: string): boolean {
++  const rel = relative(root, path);
++  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
++}
++
++export async function runMeshToCadGeneration(
++  opts: PlanReferenceRunOpts & { refine?: boolean },
++): Promise<PlanReferenceRunResult> {
++  const { refine = false, ...planOpts } = opts;
++  const outputDir = resolve(opts.outputDir);
++  if (existsSync(outputDir) && !statSync(outputDir).isDirectory()) {
++    throw new Error("outputDir must be a directory");
++  }
++  const runsRoot = resolve(
++    opts.runsRoot ?? process.env["PROCEDURA_OUTPUTS_ROOT"] ?? join(PROCEDURA_ROOT, "outputs"),
++  );
++  if (!isInside(outputDir, runsRoot)) throw new Error("outputDir must be inside runsRoot");
++  for (const file of STALE_FILES) rmSync(resolve(outputDir, file), { force: true });
++  for (const dir of STALE_DIRS) rmSync(resolve(outputDir, dir), { recursive: true, force: true });
++  const planned = await planReferenceRun({
++    ...planOpts,
++    ...(refine ? { referenceViews: REFINE_REFERENCE_VIEWS } : {}),
++    maxParts: 0,
++  });
++  const imagePath = resolve(planned.outputDir, "image.png");
++  const planPath = resolve(planned.outputDir, "plan.json");
++  if (!existsSync(imagePath) || !existsSync(planPath)) {
++    throw new Error("Mesh-to-CAD generation requires Plan 2 image.png and plan.json");
++  }
++  const planText = readFileSync(planPath, "utf8");
++  const generated = await runMeshToCadProcedura({
++    outputDir: planned.outputDir,
++    planPath,
++    planText,
++    referenceImages: planned.referenceImages.map((image) => ({
++      label: image.view,
++      path: image.path,
++    })),
++    refine,
++  });
++  const finalScad = resolve(outputDir, "final.scad");
++  const finalObj = resolve(outputDir, "final.obj");
++  if (!generated.refine.ok) {
++    throw new Error(`Mesh-to-CAD refine ended with verdict: ${generated.refine.verdict}`);
++  }
++  if (!existsSync(finalScad) || !existsSync(finalObj) ||
++    statSync(finalScad).size === 0 || statSync(finalObj).size === 0) {
++    throw new Error("Mesh-to-CAD generation did not produce complete final artifacts");
++  }
++  return planned;
++}
+diff --git a/src/pipeline_mesh2code/mesh-to-cad-plan.ts b/src/pipeline_mesh2code/mesh-to-cad-plan.ts
+new file mode 100644
+index 0000000..5d97f68
+--- /dev/null
++++ b/src/pipeline_mesh2code/mesh-to-cad-plan.ts
+@@ -0,0 +1,154 @@
++import { readFileSync, rmSync, writeFileSync } from "node:fs";
++import { dirname, join, resolve } from "node:path";
++import { Buffer } from "node:buffer";
++
++import type { CanonicalPart } from "@harness/template/llm/protocol";
++
++import { DEFAULT_MODEL, resolveModel } from "../config/models.ts";
++import { generateOnce } from "../llm/generate.ts";
++import { routeForModel } from "../llm/routes.ts";
++import {
++  DEFAULT_MAX_PARTS,
++  DEFAULT_PLAN_REVIEW_ITERS,
++  PLAN_MAX_ATTEMPTS,
++  mergeReviewedPlan,
++  parsePlanJson,
++  parsePlanReview,
++  type PartPlanItem,
++} from "../pipeline/draft-incremental.ts";
++import {
++  importReferenceRun,
++  type ImportReferenceRunResult,
++} from "./mesh-to-cad-reference.ts";
++import { ReferenceAuthority } from "../reference/authority.ts";
++import { ALL_VIEW_NAMES, type ViewName } from "../render/views.ts";
++
++const PROCEDURA_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..", "..");
++const PLAN_SYSTEM = readFileSync(join(PROCEDURA_ROOT, "prompts", "plan_system.md"), "utf8");
++const PLAN_REVIEW_SYSTEM = readFileSync(join(PROCEDURA_ROOT, "prompts", "plan_review_system.md"), "utf8");
++const DEFAULT_REFERENCE_VIEWS = ["isometric"] as const;
++
++export interface PlanReferenceRunResult extends ImportReferenceRunResult {
++  plan: PartPlanItem[];
++  referenceImages: Array<{ view: ViewName; path: string }>;
++}
++
++export interface PlanReferenceRunOpts {
++  outputDir: string;
++  meshPath: string;
++  referenceRoot?: string;
++  runsRoot?: string;
++  maxParts?: number;
++  /** Ordered render views. The first view is the authoritative image.png. */
++  referenceViews?: readonly ViewName[];
++}
++
++async function generate(
++  system: string,
++  text: string,
++  images: readonly { view: ViewName; bytes: Uint8Array }[],
++): Promise<string> {
++  const model = resolveModel(DEFAULT_MODEL);
++  const parts: CanonicalPart[] = [{ kind: "text", text }];
++  images.forEach((image, index) => {
++    parts.push({
++      kind: "text",
++      text: index === 0
++        ? `View 1 (${image.view}, primary):`
++        : `View ${index + 1} (${image.view}, supplementary):`,
++    });
++    parts.push({
++      kind: "image",
++      data: Buffer.from(image.bytes).toString("base64"),
++      mimeType: "image/png",
++    });
++  });
++  const result = await generateOnce({
++    route: routeForModel(DEFAULT_MODEL),
++    model,
++    system,
++    parts,
++  });
++  return result.text;
++}
++
++export async function planReferenceRun(opts: PlanReferenceRunOpts): Promise<PlanReferenceRunResult> {
++  const imported = await importReferenceRun(opts);
++  const runsRoot = resolve(
++    opts.runsRoot ?? process.env["PROCEDURA_OUTPUTS_ROOT"] ?? join(PROCEDURA_ROOT, "outputs"),
++  );
++  const configuredRoot = opts.referenceRoot ?? process.env["PROCEDURA_REFERENCE_ROOT"];
++  if (!configuredRoot) throw new Error("Mesh-to-CAD requires --reference-root or PROCEDURA_REFERENCE_ROOT");
++  const authority = new ReferenceAuthority(resolve(configuredRoot), [runsRoot, PROCEDURA_ROOT]);
++  for (const view of ALL_VIEW_NAMES) {
++    rmSync(join(imported.outputDir, `image-${view}.png`), { force: true });
++  }
++  const images = await authority.renderReferenceImages(
++    imported.reference.handle,
++    opts.referenceViews ?? DEFAULT_REFERENCE_VIEWS,
++  );
++  const referenceImages = images.map((image, index) => {
++    const path = join(
++      imported.outputDir,
++      index === 0 ? "image.png" : `image-${image.view}.png`,
++    );
++    writeFileSync(path, image.bytes);
++    return { view: image.view, path };
++  });
++
++  const summary = JSON.stringify(imported.summary);
++  const planPrompt =
++    "Object to decompose:\n\n" +
++    "=== TEXT DESCRIPTION ===\nNo text description was provided. Use the reference views.\n\n" +
++    `=== HOST GEOMETRY SUMMARY ===\n${summary}\n\n` +
++    "=== REFERENCE VIEWS ===\nView 1 is authoritative; later views are supplementary.\n\n";
++
++  let plan: PartPlanItem[] = [];
++  let parseError = "unparseable response";
++  for (let attempt = 1; attempt <= PLAN_MAX_ATTEMPTS; attempt++) {
++    const retryNote = attempt > 1
++      ? `Your previous reply could not be parsed (${parseError}). `
++      : "";
++    const response = await generate(
++      PLAN_SYSTEM,
++      planPrompt + retryNote + "Produce the ordered JSON build plan now. Return ONLY the JSON array.",
++      images,
++    );
++    try {
++      plan = parsePlanJson(response, opts.maxParts ?? DEFAULT_MAX_PARTS);
++      break;
++    } catch (error) {
++      parseError = (error as Error).message;
++    }
++  }
++  if (plan.length === 0) throw new Error(`planning failed: ${parseError}`);
++
++  for (let iteration = 0; iteration < DEFAULT_PLAN_REVIEW_ITERS; iteration++) {
++    const listed = plan
++      .map((part, index) => `${index + 1}. ${part.name} (${part.level ?? "L?"}): ${part.description}`)
++      .join("\n");
++    const reviewPrompt =
++      "Review this build plan against the reference views and text. " +
++      "ADD-AND-SHARPEN ONLY: add genuinely missing parts and sharpen vague " +
++      "descriptions — never merge, remove, rename, or reorder the planned " +
++      "parts, and keep the planner's left/right assignments.\n\n" +
++      "=== TEXT DESCRIPTION ===\nNo text description was provided. Use the reference views.\n\n" +
++      `=== HOST GEOMETRY SUMMARY ===\n${summary}\n\n` +
++      `=== CURRENT PLAN (${plan.length} parts) ===\n${listed}\n\n` +
++      "Return ONLY the JSON object {ok, notes, plan}.";
++    try {
++      const review = parsePlanReview(
++        await generate(PLAN_REVIEW_SYSTEM, reviewPrompt, images),
++        opts.maxParts ?? DEFAULT_MAX_PARTS,
++      );
++      if (!review) break;
++      if (review.plan) plan = mergeReviewedPlan(plan, review.plan).plan;
++      if (review.ok) break;
++    } catch {
++      break;
++    }
++  }
++
++  writeFileSync(join(imported.outputDir, "plan.json"), JSON.stringify(plan, null, 2), "utf8");
++  return { ...imported, plan, referenceImages };
++}
+diff --git a/src/pipeline_mesh2code/mesh-to-cad-reference.ts b/src/pipeline_mesh2code/mesh-to-cad-reference.ts
+new file mode 100644
+index 0000000..7acadb7
+--- /dev/null
++++ b/src/pipeline_mesh2code/mesh-to-cad-reference.ts
+@@ -0,0 +1,86 @@
++import {
++  existsSync,
++  mkdirSync,
++  mkdtempSync,
++  renameSync,
++  rmSync,
++  statSync,
++  writeFileSync,
++} from "node:fs";
++import { dirname, isAbsolute, join, relative, resolve } from "node:path";
++import { randomUUID } from "node:crypto";
++
++import {
++  ReferenceAuthority,
++  type ReferenceDescriptor,
++  type ReferenceSummary,
++} from "../reference/authority.ts";
++
++const PROCEDURA_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..", "..");
++
++export interface ImportReferenceRunOpts {
++  outputDir: string;
++  meshPath?: string;
++  referenceHandle?: string;
++  referenceRoot?: string;
++  runsRoot?: string;
++}
++
++export interface ImportReferenceRunResult {
++  outputDir: string;
++  reference: ReferenceDescriptor;
++  summary: ReferenceSummary;
++}
++
++function isInside(path: string, root: string): boolean {
++  const rel = relative(root, path);
++  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
++}
++
++export async function importReferenceRun(opts: ImportReferenceRunOpts): Promise<ImportReferenceRunResult> {
++  if (Boolean(opts.meshPath) === Boolean(opts.referenceHandle)) {
++    throw new Error("importReferenceRun requires exactly one of meshPath or referenceHandle");
++  }
++  const outputDir = resolve(opts.outputDir);
++  if (existsSync(outputDir) && !statSync(outputDir).isDirectory()) {
++    throw new Error("outputDir must be a directory");
++  }
++  const runsRoot = resolve(opts.runsRoot ?? process.env["PROCEDURA_OUTPUTS_ROOT"] ?? join(PROCEDURA_ROOT, "outputs"));
++  if (!isInside(outputDir, runsRoot)) throw new Error("outputDir must be inside runsRoot");
++  const configuredRoot = opts.referenceRoot ?? process.env["PROCEDURA_REFERENCE_ROOT"];
++  if (!configuredRoot) throw new Error("Mesh-to-CAD requires --reference-root or PROCEDURA_REFERENCE_ROOT");
++  const authority = new ReferenceAuthority(resolve(configuredRoot), [runsRoot, PROCEDURA_ROOT]);
++  let created = false;
++  let createdHandle: string | null = null;
++  const outputExisted = existsSync(outputDir);
++  if (!outputExisted) mkdirSync(dirname(outputDir), { recursive: true });
++  const stagingDir = outputExisted
++    ? outputDir
++    : mkdtempSync(join(dirname(outputDir), "." + randomUUID() + ".reference-import-"));
++  const descriptorPath = outputExisted
++    ? join(outputDir, ".reference-" + randomUUID() + ".json")
++    : join(stagingDir, "reference.json");
++  try {
++    const reference = opts.meshPath
++      ? await authority.importReference(opts.meshPath)
++      : { handle: opts.referenceHandle! };
++    created = Boolean(opts.meshPath);
++    createdHandle = created ? reference.handle : null;
++    const summary = authority.inspectReferenceSummary(reference.handle);
++    if (!outputExisted) mkdirSync(stagingDir, { recursive: true });
++    writeFileSync(descriptorPath, JSON.stringify({
++      schemaVersion: 1,
++      handle: reference.handle,
++      format: "stl",
++      summary,
++    }, null, 2), "utf8");
++    if (!outputExisted) renameSync(stagingDir, outputDir);
++    else renameSync(descriptorPath, join(outputDir, "reference.json"));
++    return { outputDir, reference, summary };
++  } catch (error) {
++    if (createdHandle) authority.discardReference(createdHandle);
++    if (!outputExisted) rmSync(stagingDir, { recursive: true, force: true });
++    else rmSync(descriptorPath, { force: true });
++    throw error;
++  }
++}
+diff --git a/src/pipeline_mesh2code/procedura_adapter.ts b/src/pipeline_mesh2code/procedura_adapter.ts
+new file mode 100644
+index 0000000..8d27a00
+--- /dev/null
++++ b/src/pipeline_mesh2code/procedura_adapter.ts
+@@ -0,0 +1,35 @@
++import { runProcedura, type RunProceduraResult } from "../pipeline/procedura.ts";
++
++/** Inputs owned by the Mesh-to-CAD host when invoking the Procedura pipeline. */
++export interface MeshToCadProceduraOpts {
++  outputDir: string;
++  planPath: string;
++  planText: string;
++  referenceImages: readonly { label: string; path: string }[];
++  refine: boolean;
++}
++
++/**
++ * Run the Mesh-to-CAD build through the existing Procedura implementation.
++ *
++ * These settings are deliberately kept here: incremental drafting, direct
++ * refine, and open-loop promotion are Mesh-to-CAD integration choices, not
++ * defaults for ordinary Procedura callers.
++ */
++export function runMeshToCadProcedura(
++  opts: MeshToCadProceduraOpts,
++): Promise<RunProceduraResult> {
++  return runProcedura({
++    text: "Generate editable CAD from this host-produced plan:\n\n" + opts.planText,
++    outputDir: opts.outputDir,
++    incremental: true,
++    externalExecution: {
++      inputImages: opts.referenceImages,
++      inputPlan: opts.planPath,
++      refineMode: "direct",
++      draftPromotion: "open-loop",
++    },
++    redo: true,
++    refine: opts.refine,
++  });
++}

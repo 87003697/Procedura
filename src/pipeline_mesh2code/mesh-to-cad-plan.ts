@@ -15,7 +15,7 @@ import {
   parsePlanJson,
   parsePlanReview,
   type PartPlanItem,
-} from "./draft-incremental.ts";
+} from "../pipeline/draft-incremental.ts";
 import {
   importReferenceRun,
   type ImportReferenceRunResult,

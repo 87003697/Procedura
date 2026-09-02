@@ -43,7 +43,7 @@ function parse(argv: string[]): Args {
 }
 
 const args = parse(process.argv.slice(2));
-const { runMeshToCadGeneration } = await import("../src/pipeline/mesh-to-cad-generation.ts");
+const { runMeshToCadGeneration } = await import("../src/pipeline_mesh2code/mesh-to-cad-generation.ts");
 const result = await runMeshToCadGeneration({
   outputDir: args.outputDir,
   meshPath: args.meshPath,

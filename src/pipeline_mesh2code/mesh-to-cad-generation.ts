@@ -5,7 +5,7 @@ import {
   type PlanReferenceRunOpts,
   type PlanReferenceRunResult,
 } from "./mesh-to-cad-plan.ts";
-import { runProcedura } from "./procedura.ts";
+import { runMeshToCadProcedura } from "./procedura_adapter.ts";
 import type { ViewName } from "../render/views.ts";
 
 const PROCEDURA_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..", "..");
@@ -53,19 +53,15 @@ export async function runMeshToCadGeneration(
     throw new Error("Mesh-to-CAD generation requires Plan 2 image.png and plan.json");
   }
   const planText = readFileSync(planPath, "utf8");
-  const generated = await runProcedura({
-    text: "Generate editable CAD from this host-produced plan:\n\n" + planText,
+  const generated = await runMeshToCadProcedura({
     outputDir: planned.outputDir,
-    incremental: true,
-    inputImages: planned.referenceImages.map((image) => ({
+    planPath,
+    planText,
+    referenceImages: planned.referenceImages.map((image) => ({
       label: image.view,
       path: image.path,
     })),
-    inputPlan: planPath,
-    redo: true,
     refine,
-    refineMode: "direct",
-    draftPromotion: "open-loop",
   });
   const finalScad = resolve(outputDir, "final.scad");
   const finalObj = resolve(outputDir, "final.obj");

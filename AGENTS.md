@@ -12,6 +12,14 @@ cannot meet the requirement. At completion, list every modified upstream file,
 state why each edit is unavoidable, and confirm that removing the new capability
 would leave upstream behavior and contracts unchanged.
 
+## Troubleshooting notes
+
+When diagnosing setup failures, dependency resolution, tool availability, or
+environment-specific errors, consult `.agents/notes/` first. Treat the notes as
+project troubleshooting history: verify the recorded commands and current
+environment before applying a fix, and append a dated note when a new root
+cause or reliable workaround is found.
+
 ## Agent skills
 
 ### Issue tracker
