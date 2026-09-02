@@ -1,0 +1,1866 @@
+diff --git a/experiments/octree-mapping/README.md b/experiments/octree-mapping/README.md
+new file mode 100644
+index 0000000..ca9ec2d
+--- /dev/null
++++ b/experiments/octree-mapping/README.md
+@@ -0,0 +1,99 @@
++# Octree mapping shadow experiment
++
++This removable experiment evaluates one question: can multiscale unbalanced
++optimal transport recover useful full-surface correspondences between GT and
++candidate occupied octree cells in their already-shared absolute frame?
++
++The mapping CLI does not read raw meshes, compile OpenSCAD, call an LLM, change
++a model, or participate in Procedura's draft/refine lifecycle. Its inputs are
++private leaf-cell documents prepared by a trusted host. The optional Plan 4
++preparation script below is that trusted host for one retained local run and is
++not registered with Procedura. Outputs contain reconstructive cell data and
++must remain private; they are not an Agent prompt or public run artifact.
++
++## Setup and run
++
++```bash
++cd experiments/octree-mapping
++python3.12 -m venv .venv
++.venv/bin/pip install -e .
++.venv/bin/procedura-octree-map --input input.json --output mapping.json
++```
++
++The input schema is `procedura.octree-mapping-input/2`. All leaves are at the
++frame's `maxDepth`; their Morton prefixes use the canonical XYZ child order
++(`x` bit 2, `y` bit 1, `z` bit 0). Every leaf carries its area-weighted mean
++oriented surface normal. Candidate part weights on a cell sum to one.
++At the starting depth the solver maps every candidate occupied node against every GT occupied
++node. Each finer depth materializes only occupied child pairs inherited from retained parent
++support, same-grid halo neighbors, and bidirectional nearest fallbacks. Same-prefix occupancy is
++a zero-distance candidate, not a fixed identity. Generalized Sinkhorn updates reduce directly
++over that sparse edge set in the log domain, so no fine-level Cartesian matrix is allocated.
++
++The default resolved depth is `min(6, inputMaxDepth)`. Depth 8 is supported for
++bounded scenarios. The solver refuses a level when the materialized edge set exceeds
++`--max-pairs`.
++
++The output schema is `procedura.octree-mapping-report/3`. Every solved depth is
++reported under `levels[]` as an exact compact `summary`, `candidateCells`, and
++`gtCells` record. Candidate cells expose only `prefix`, `mass`, `displacementMm`,
++`spreadCells`, and `sourceMarginalRatio`; GT cells expose only
++`prefix`, `mass`, and `targetMarginalRatio`. The shared frame, level depth, prefix,
++and displacement vector are sufficient to derive cell centers, parent prefixes,
++direction, distance, and the transported GT barycenter. `displacementMm` starts at
++the derivable grid cell center, not the private occupied-surface centroid. Full target
++coupling, per-cell entropy, and all part-level summaries or fits are deliberately absent.
++Semantic part provenance is not included. Cell-level evidence is the complete output contract
++for this shadow experiment.
++
++The dimensionless matching cost is the weighted sum of squared position in current-depth cell
++units, mean-normal difference divided by four, and binary local-occupancy-stencil Hamming
++distance. `--position-weight`, `--normal-weight`, and `--neighborhood-weight` independently
++enable those terms; `--neighborhood-radius-cells` defines the stencil. A zero weight skips the
++term. `--unmatched-penalty-cells` is the only unmatched control: it replaces the former reach
++name and sets the UOT KL marginal penalty in finest-cell units. The default `1/0/0`, radius 1,
++penalty 8 profile is mathematically the prior position-only solver. No semantic part provenance
++is read by candidate generation, costs, support, or Sinkhorn or included in the output.
++
++For the retained Plan 4 transformer validation, `prepare_plan4_shadow.py`
++converts the private GT OBJ, final candidate OBJ, canonical whole STL, and the
++renderer-retained per-part STL manifest into that same contract. It uses the
++fixed `[-1, 1]^3` root, verifies whole STL/OBJ frame identity, and applies the
++single combined-part-bounds-to-final-OBJ uniform transform; it performs no ICP,
++rotation, or semantic inference. Because the final Boolean union is retriangulated,
++each final-surface triangle inherits the geometrically nearest retained part-surface
++sample before voxelization; occupied cells always come from the final candidate mesh.
++The
++generated input remains private because its occupied cells and provenance are
++reconstructive. The separate metadata file records paths, bounds, counts,
++transform, time, and peak memory without containing node geometry.
++
++The real-data ablation writes four private reports plus one aggregate summary:
++
++```bash
++.venv/bin/python run_plan4_ablation.py \
++  --input /tmp/plan4-depth6-mapping-input-v2.json \
++  --output-dir /tmp/plan4-geometric-ablation \
++  --summary /tmp/plan4-geometric-ablation-summary.json
++```
++
++The profiles are position `1/0/0, unmatched=8`, normal `1/1/0, 8`, neighborhood `1/1/1, 8`,
++and explicit-unmatched `1/1/1, 2`. They are fixed before examining the real outputs.
++Because schema `/3` intentionally omits full target coupling and all part-level
++aggregation, the compact ablation summary reports only solver levels, marginal ranges,
++and runtime. Target-dependent and part-level diagnostics remain only in frozen prior
++validation artifacts.
++
++## Black-box acceptance
++
++```bash
++.venv/bin/python validate_scenarios.py
++```
++
++This command runs the installed CLI on generated end-to-end scenarios. It is
++not part of the repository unit-test suite. It covers identity, translation,
++opposed leg motion, missing armour, extra geometry, coarse-to-fine recovery,
++mixed provenance below input max depth, and a bounded depth-8 case.
++It also covers normal and occupancy-neighborhood geometric disambiguation.
++Each successful case also checks the exact compact field sets, complete solved-depth
++coverage, array counts, derivable parent prefixes, and millimetre displacement vectors.
+diff --git a/experiments/octree-mapping/octree_mapping/__init__.py b/experiments/octree-mapping/octree_mapping/__init__.py
+new file mode 100644
+index 0000000..afcd6cc
+--- /dev/null
++++ b/experiments/octree-mapping/octree_mapping/__init__.py
+@@ -0,0 +1,7 @@
++"""Shadow-only occupied-octree mapping."""
++
++from .contract import MappingInput, load_mapping_input
++from .config import MappingConfig
++from .mapping import SolverConfig, map_octrees
++
++__all__ = ["MappingConfig", "MappingInput", "SolverConfig", "load_mapping_input", "map_octrees"]
+diff --git a/experiments/octree-mapping/octree_mapping/__main__.py b/experiments/octree-mapping/octree_mapping/__main__.py
+new file mode 100644
+index 0000000..4e28416
+--- /dev/null
++++ b/experiments/octree-mapping/octree_mapping/__main__.py
+@@ -0,0 +1,3 @@
++from .cli import main
++
++main()
+diff --git a/experiments/octree-mapping/octree_mapping/cli.py b/experiments/octree-mapping/octree_mapping/cli.py
+new file mode 100644
+index 0000000..fcf8f2f
+--- /dev/null
++++ b/experiments/octree-mapping/octree_mapping/cli.py
+@@ -0,0 +1,68 @@
++"""Command line seam for the removable shadow experiment."""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++import resource
++import time
++
++from .contract import load_mapping_input
++from .config import from_profile
++from .mapping import map_octrees
++
++
++def _parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(description="Map private occupied octrees with multiscale UOT")
++    parser.add_argument("--input", required=True)
++    parser.add_argument("--output", required=True)
++    parser.add_argument("--profile", choices=("position", "normal", "neighborhood", "unmatched"), default="position")
++    parser.add_argument("--start-depth", type=int, default=3)
++    parser.add_argument("--max-depth", type=int)
++    parser.add_argument("--blur-cells", type=float, default=0.75)
++    parser.add_argument("--position-weight", type=float)
++    parser.add_argument("--normal-weight", type=float)
++    parser.add_argument("--neighborhood-weight", type=float)
++    parser.add_argument("--neighborhood-radius-cells", type=int)
++    parser.add_argument("--unmatched-penalty-cells", type=float)
++    parser.add_argument("--support-relative", type=float)
++    parser.add_argument("--halo-cells", type=int)
++    parser.add_argument("--max-pairs", type=int)
++    parser.add_argument("--max-iterations", type=int)
++    parser.add_argument("--tolerance", type=float)
++    return parser
++
++
++def main() -> None:
++    args = _parser().parse_args()
++    started = time.perf_counter()
++    data = load_mapping_input(args.input)
++    config = from_profile(
++        args.profile,
++        start_depth=args.start_depth,
++        max_depth=args.max_depth if args.max_depth is not None else min(6, data.frame.max_depth),
++        blur_cells=args.blur_cells,
++        position_weight=args.position_weight,
++        normal_weight=args.normal_weight,
++        neighborhood_weight=args.neighborhood_weight,
++        neighborhood_radius_cells=args.neighborhood_radius_cells,
++        unmatched_penalty_cells=args.unmatched_penalty_cells,
++        support_relative=args.support_relative,
++        halo_cells=args.halo_cells,
++        max_pairs=args.max_pairs,
++        max_iterations=args.max_iterations,
++        tolerance=args.tolerance,
++    )
++    report = map_octrees(data, config)
++    report["runtime"] = {
++        "elapsedSeconds": time.perf_counter() - started,
++        "peakRssBytes": int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss),
++    }
++    destination = Path(args.output)
++    destination.parent.mkdir(parents=True, exist_ok=True)
++    destination.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/experiments/octree-mapping/octree_mapping/config.py b/experiments/octree-mapping/octree_mapping/config.py
+new file mode 100644
+index 0000000..e5c725d
+--- /dev/null
++++ b/experiments/octree-mapping/octree_mapping/config.py
+@@ -0,0 +1,39 @@
++"""Immutable mapping configuration and named experiment profiles."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, replace
++
++
++@dataclass(frozen=True)
++class MappingConfig:
++    start_depth: int = 3
++    max_depth: int = 6
++    blur_cells: float = 0.75
++    position_weight: float = 1.0
++    normal_weight: float = 0.0
++    neighborhood_weight: float = 0.0
++    neighborhood_radius_cells: int = 1
++    unmatched_penalty_cells: float = 8.0
++    support_relative: float = 1e-5
++    halo_cells: int = 1
++    max_pairs: int = 4_000_000
++    max_iterations: int = 5_000
++    tolerance: float = 1e-7
++
++
++PROFILE_DEFAULTS = {
++    "position": {"position_weight": 1.0, "normal_weight": 0.0, "neighborhood_weight": 0.0, "unmatched_penalty_cells": 8.0},
++    "normal": {"position_weight": 1.0, "normal_weight": 1.0, "neighborhood_weight": 0.0, "unmatched_penalty_cells": 8.0},
++    "neighborhood": {"position_weight": 1.0, "normal_weight": 1.0, "neighborhood_weight": 1.0, "unmatched_penalty_cells": 8.0},
++    "unmatched": {"position_weight": 1.0, "normal_weight": 1.0, "neighborhood_weight": 1.0, "unmatched_penalty_cells": 2.0},
++}
++
++
++def from_profile(name: str, **overrides: object) -> MappingConfig:
++    try:
++        values = PROFILE_DEFAULTS[name].copy()
++    except KeyError as error:
++        raise ValueError(f"unknown mapping profile: {name}") from error
++    values.update({key: value for key, value in overrides.items() if value is not None})
++    return replace(MappingConfig(), **values)
+diff --git a/experiments/octree-mapping/octree_mapping/contract.py b/experiments/octree-mapping/octree_mapping/contract.py
+new file mode 100644
+index 0000000..78ff091
+--- /dev/null
++++ b/experiments/octree-mapping/octree_mapping/contract.py
+@@ -0,0 +1,139 @@
++"""Closed input contract for the shadow mapping experiment."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++import json
++import math
++from pathlib import Path
++from typing import Any
++
++
++SCHEMA = "procedura.octree-mapping-input/2"
++
++
++@dataclass(frozen=True)
++class Frame:
++    min_mm: tuple[float, float, float]
++    side_mm: float
++    max_depth: int
++
++
++@dataclass(frozen=True)
++class PartWeight:
++    name: str
++    weight: float
++
++
++@dataclass(frozen=True)
++class Cell:
++    prefix: int
++    mass: float
++    normal: tuple[float, float, float]
++    parts: tuple[PartWeight, ...] = ()
++
++
++@dataclass(frozen=True)
++class MappingInput:
++    frame: Frame
++    gt: tuple[Cell, ...]
++    candidate: tuple[Cell, ...]
++
++
++def _object(value: Any, keys: set[str], label: str) -> dict[str, Any]:
++    if not isinstance(value, dict) or set(value) != keys:
++        raise ValueError(f"{label} must contain exactly {sorted(keys)}")
++    return value
++
++
++def _finite(value: Any, label: str, *, positive: bool = False) -> float:
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        raise ValueError(f"{label} must be a finite number")
++    number = float(value)
++    if not math.isfinite(number) or (positive and number <= 0):
++        raise ValueError(f"{label} must be {'positive and ' if positive else ''}finite")
++    return number
++
++
++def _frame(value: Any) -> Frame:
++    item = _object(value, {"minMm", "sideMm", "maxDepth"}, "frame")
++    minimum = item["minMm"]
++    if not isinstance(minimum, list) or len(minimum) != 3:
++        raise ValueError("frame.minMm must contain three numbers")
++    max_depth = item["maxDepth"]
++    if isinstance(max_depth, bool) or not isinstance(max_depth, int) or not 4 <= max_depth <= 8:
++        raise ValueError("frame.maxDepth must be an integer in 4..8")
++    return Frame(
++        tuple(_finite(v, "frame.minMm") for v in minimum),
++        _finite(item["sideMm"], "frame.sideMm", positive=True),
++        max_depth,
++    )
++
++
++def _parse_cell_geometry(item: dict[str, Any], label: str) -> tuple[float, tuple[float, float, float]]:
++    raw_normal = item["normal"]
++    if not isinstance(raw_normal, list) or len(raw_normal) != 3:
++        raise ValueError(f"{label}.normal must contain three numbers")
++    normal = tuple(_finite(component, "cell normal") for component in raw_normal)
++    if sum(component * component for component in normal) > 1.000001:
++        raise ValueError(f"{label}.normal magnitude must not exceed one")
++    return _finite(item["mass"], "cell mass", positive=True), normal
++
++
++def _parse_parts(value: Any, label: str) -> tuple[PartWeight, ...]:
++    if not isinstance(value, list) or not value:
++        raise ValueError(f"{label}.parts must be non-empty")
++    parsed: list[PartWeight] = []
++    part_names: set[str] = set()
++    for part_index, raw_part in enumerate(value):
++        part = _object(raw_part, {"name", "weight"}, f"{label}.parts[{part_index}]")
++        name = part["name"]
++        if not isinstance(name, str) or not name or name in part_names:
++            raise ValueError(f"{label} has invalid or duplicate part name")
++        part_names.add(name)
++        parsed.append(PartWeight(name, _finite(part["weight"], "part weight", positive=True)))
++    total = sum(part.weight for part in parsed)
++    if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-9):
++        raise ValueError(f"{label} part weights must sum to one")
++    return tuple(parsed)
++
++
++def _cells(value: Any, frame: Frame, *, candidate: bool) -> tuple[Cell, ...]:
++    label = "candidate.cells" if candidate else "gt.cells"
++    if not isinstance(value, list) or not value:
++        raise ValueError(f"{label} must be a non-empty array")
++    limit = 1 << (3 * frame.max_depth)
++    cells: list[Cell] = []
++    seen: set[int] = set()
++    keys = {"prefix", "mass", "normal", "parts"} if candidate else {"prefix", "mass", "normal"}
++    for index, raw in enumerate(value):
++        item = _object(raw, keys, f"{label}[{index}]")
++        item_label = f"{label}[{index}]"
++        prefix = item["prefix"]
++        if isinstance(prefix, bool) or not isinstance(prefix, int) or not 0 <= prefix < limit:
++            raise ValueError(f"{label}[{index}].prefix is outside maxDepth")
++        if prefix in seen:
++            raise ValueError(f"{label} contains duplicate prefix {prefix}")
++        seen.add(prefix)
++        mass, normal = _parse_cell_geometry(item, item_label)
++        parts = _parse_parts(item["parts"], item_label) if candidate else ()
++        cells.append(Cell(prefix, mass, normal, parts))
++    return tuple(sorted(cells, key=lambda cell: cell.prefix))
++
++
++def parse_mapping_input(value: Any) -> MappingInput:
++    root = _object(value, {"schema", "frame", "gt", "candidate"}, "input")
++    if root["schema"] != SCHEMA:
++        raise ValueError(f"input.schema must be {SCHEMA}")
++    frame = _frame(root["frame"])
++    gt = _object(root["gt"], {"cells"}, "gt")
++    candidate = _object(root["candidate"], {"cells"}, "candidate")
++    return MappingInput(
++        frame,
++        _cells(gt["cells"], frame, candidate=False),
++        _cells(candidate["cells"], frame, candidate=True),
++    )
++
++
++def load_mapping_input(path: str | Path) -> MappingInput:
++    return parse_mapping_input(json.loads(Path(path).read_text(encoding="utf-8")))
+diff --git a/experiments/octree-mapping/octree_mapping/costs.py b/experiments/octree-mapping/octree_mapping/costs.py
+new file mode 100644
+index 0000000..140b55f
+--- /dev/null
++++ b/experiments/octree-mapping/octree_mapping/costs.py
+@@ -0,0 +1,20 @@
++"""Normalized geometric matching cost components."""
++
++from __future__ import annotations
++
++import numpy as np
++
++
++def position_cost(source: np.ndarray, target: np.ndarray, rows: np.ndarray, columns: np.ndarray, cell_side: float) -> np.ndarray:
++    return np.sum(((source[rows] - target[columns]) / cell_side) ** 2, axis=1)
++
++
++def normal_cost(source: np.ndarray, target: np.ndarray, rows: np.ndarray, columns: np.ndarray) -> np.ndarray:
++    return np.sum((source[rows] - target[columns]) ** 2, axis=1) / 4.0
++
++
++def neighborhood_cost(source: np.ndarray, target: np.ndarray, rows: np.ndarray, columns: np.ndarray) -> np.ndarray:
++    difference = np.zeros(len(rows), dtype=np.float64)
++    for index in range(source.shape[1]):
++        difference += source[rows, index] != target[columns, index]
++    return difference / source.shape[1]
+diff --git a/experiments/octree-mapping/octree_mapping/mapping.py b/experiments/octree-mapping/octree_mapping/mapping.py
+new file mode 100644
+index 0000000..215ef66
+--- /dev/null
++++ b/experiments/octree-mapping/octree_mapping/mapping.py
+@@ -0,0 +1,481 @@
++"""Sparse hierarchical unbalanced OT and compact cell-level evidence."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++import math
++from typing import Any
++
++import numpy as np
++from scipy.spatial import cKDTree
++
++from .contract import Cell, Frame, MappingInput
++from .config import MappingConfig
++from .costs import neighborhood_cost, normal_cost, position_cost
++from .unmatched import scales
++
++
++OUTPUT_SCHEMA = "procedura.octree-mapping-report/3"
++
++
++SolverConfig = MappingConfig
++
++
++@dataclass(frozen=True)
++class Node:
++    prefix: int
++    mass: float
++    center: np.ndarray
++    normal: np.ndarray
++
++
++@dataclass(frozen=True)
++class SparsePlan:
++    rows: np.ndarray
++    columns: np.ndarray
++    weights: np.ndarray
++    row_starts: np.ndarray
++
++
++@dataclass(frozen=True)
++class NodeEvidence:
++    source_marginal_ratio: float
++    displacement_mm: np.ndarray | None
++    spread_mm: float | None
++
++
++@dataclass(frozen=True)
++class LevelEvidence:
++    depth: int
++    source: list[Node]
++    target: list[Node]
++    candidate_pair_count: int
++    support_pair_count: int
++    iterations: int
++    solver_error: float
++    candidate: list[NodeEvidence]
++    target_marginal_ratios: np.ndarray
++
++
++def _decode(prefix: int, depth: int) -> tuple[int, int, int]:
++    xyz = [0, 0, 0]
++    for shift in range(depth - 1, -1, -1):
++        child = (prefix >> (3 * shift)) & 7
++        xyz[0] = (xyz[0] << 1) | ((child >> 2) & 1)
++        xyz[1] = (xyz[1] << 1) | ((child >> 1) & 1)
++        xyz[2] = (xyz[2] << 1) | (child & 1)
++    return xyz[0], xyz[1], xyz[2]
++
++
++def _cell_center(frame: Frame, prefix: int, depth: int) -> np.ndarray:
++    xyz = np.asarray(_decode(prefix, depth), dtype=np.float64)
++    side = frame.side_mm / (1 << depth)
++    return np.asarray(frame.min_mm, dtype=np.float64) + (xyz + 0.5) * side
++
++
++def _leaf_center(frame: Frame, prefix: int) -> np.ndarray:
++    return _cell_center(frame, prefix, frame.max_depth)
++
++
++def _aggregate(frame: Frame, cells: tuple[Cell, ...], depth: int) -> list[Node]:
++    shift = 3 * (frame.max_depth - depth)
++    groups: dict[int, dict[str, Any]] = {}
++    for cell in cells:
++        prefix = cell.prefix >> shift
++        group = groups.setdefault(
++            prefix,
++            {"mass": 0.0, "center": np.zeros(3), "normal": np.zeros(3)},
++        )
++        group["mass"] += cell.mass
++        group["center"] += cell.mass * _leaf_center(frame, cell.prefix)
++        group["normal"] += cell.mass * np.asarray(cell.normal)
++    nodes: list[Node] = []
++    for prefix, group in sorted(groups.items()):
++        mass = float(group["mass"])
++        nodes.append(Node(prefix, mass, group["center"] / mass, group["normal"] / mass))
++    return nodes
++
++
++def _validate_config(frame: Frame, config: SolverConfig) -> None:
++    if not 1 <= config.start_depth <= config.max_depth <= frame.max_depth:
++        raise ValueError("solver depths must satisfy 1 <= start <= max <= frame.maxDepth")
++    if config.max_depth < 4 or config.max_depth > 8:
++        raise ValueError("solver maxDepth must be in 4..8")
++    if config.blur_cells <= 0 or config.unmatched_penalty_cells <= 0:
++        raise ValueError("blurCells and unmatchedPenaltyCells must be positive")
++    weights = (config.position_weight, config.normal_weight, config.neighborhood_weight)
++    if any(weight < 0 for weight in weights) or not any(weight > 0 for weight in weights):
++        raise ValueError("matching weights must be non-negative with at least one positive")
++    if config.neighborhood_radius_cells <= 0:
++        raise ValueError("neighborhoodRadiusCells must be positive")
++    if not 0 < config.support_relative < 1:
++        raise ValueError("supportRelative must be in (0, 1)")
++    if config.halo_cells < 0 or config.max_pairs <= 0:
++        raise ValueError("haloCells must be non-negative and maxPairs positive")
++    if config.max_iterations <= 0 or config.tolerance <= 0:
++        raise ValueError("maxIterations and tolerance must be positive")
++
++
++def _candidate_pairs(
++    source: list[Node],
++    target: list[Node],
++    depth: int,
++    previous_support: set[tuple[int, int]] | None,
++    halo_cells: int,
++    limit: int,
++) -> tuple[np.ndarray, np.ndarray]:
++    if previous_support is None:
++        count = len(source) * len(target)
++        if count > limit:
++            raise RuntimeError(
++                f"depth {depth} requires {count} candidate pairs, exceeding maxPairs={limit}"
++            )
++        return (
++            np.repeat(np.arange(len(source), dtype=np.int64), len(target)),
++            np.tile(np.arange(len(target), dtype=np.int64), len(source)),
++        )
++
++    target_by_parent: dict[int, list[int]] = {}
++    target_by_xyz: dict[tuple[int, int, int], int] = {}
++    for j, node in enumerate(target):
++        target_by_parent.setdefault(node.prefix >> 3, []).append(j)
++        target_by_xyz[_decode(node.prefix, depth)] = j
++    inherited_by_source_parent: dict[int, set[int]] = {}
++    for source_parent, target_parent in previous_support:
++        inherited_by_source_parent.setdefault(source_parent, set()).add(target_parent)
++
++    pairs: set[tuple[int, int]] = set()
++
++    def add(pair: tuple[int, int]) -> None:
++        if pair in pairs:
++            return
++        if len(pairs) == limit:
++            raise RuntimeError(
++                f"depth {depth} requires more than {limit} candidate pairs, "
++                f"exceeding maxPairs={limit}"
++            )
++        pairs.add(pair)
++
++    for i, node in enumerate(source):
++        source_parent = node.prefix >> 3
++        for target_parent in inherited_by_source_parent.get(source_parent, ()):
++            for j in target_by_parent.get(target_parent, ()):
++                add((i, j))
++        x, y, z = _decode(node.prefix, depth)
++        for dx in range(-halo_cells, halo_cells + 1):
++            for dy in range(-halo_cells, halo_cells + 1):
++                for dz in range(-halo_cells, halo_cells + 1):
++                    j = target_by_xyz.get((x + dx, y + dy, z + dz))
++                    if j is not None:
++                        add((i, j))
++
++    source_centers = np.stack([node.center for node in source])
++    target_centers = np.stack([node.center for node in target])
++    nearest_target = cKDTree(target_centers).query(source_centers)[1]
++    nearest_source = cKDTree(source_centers).query(target_centers)[1]
++    for i, j in enumerate(nearest_target):
++        add((i, int(j)))
++    for j, i in enumerate(nearest_source):
++        add((int(i), j))
++    ordered = np.asarray(sorted(pairs), dtype=np.int64)
++    return ordered[:, 0], ordered[:, 1]
++
++
++def _starts(indices: np.ndarray) -> np.ndarray:
++    return np.flatnonzero(np.r_[True, indices[1:] != indices[:-1]])
++
++
++def _segment_logsumexp(values: np.ndarray, starts: np.ndarray) -> np.ndarray:
++    maxima = np.maximum.reduceat(values, starts)
++    totals = np.add.reduceat(np.exp(values - np.repeat(maxima, np.diff(np.r_[starts, len(values)]))), starts)
++    return maxima + np.log(totals)
++
++
++def _occupancy_descriptors(nodes: list[Node], depth: int, radius: int) -> np.ndarray:
++    occupied = {_decode(node.prefix, depth) for node in nodes}
++    offsets = [
++        (dx, dy, dz)
++        for dx in range(-radius, radius + 1)
++        for dy in range(-radius, radius + 1)
++        for dz in range(-radius, radius + 1)
++        if (dx, dy, dz) != (0, 0, 0)
++    ]
++    descriptors = np.empty((len(nodes), len(offsets)), dtype=bool)
++    for i, node in enumerate(nodes):
++        x, y, z = _decode(node.prefix, depth)
++        descriptors[i] = [
++            (x + dx, y + dy, z + dz) in occupied for dx, dy, dz in offsets
++        ]
++    return descriptors
++
++
++def _log_sinkhorn(
++    source_mass: np.ndarray,
++    target_mass: np.ndarray,
++    rows: np.ndarray,
++    columns: np.ndarray,
++    cost: np.ndarray,
++    epsilon: float,
++    rho: float,
++    max_iterations: int,
++    tolerance: float,
++) -> tuple[SparsePlan, int, float]:
++    log_source = np.log(source_mass)
++    log_target = np.log(target_mass)
++    log_kernel = log_source[rows] + log_target[columns] - cost / epsilon
++    row_starts = _starts(rows)
++    column_order = np.lexsort((rows, columns))
++    ordered_columns = columns[column_order]
++    column_starts = _starts(ordered_columns)
++    exponent = rho / (rho + epsilon)
++    log_u = np.zeros_like(source_mass)
++    log_v = np.zeros_like(target_mass)
++    final_error = math.inf
++    for iteration in range(1, max_iterations + 1):
++        previous_u = log_u.copy()
++        previous_v = log_v.copy()
++        row_sum = _segment_logsumexp(log_kernel + log_v[columns], row_starts)
++        log_u = exponent * (log_source - row_sum)
++        column_sum = _segment_logsumexp(
++            log_kernel[column_order] + log_u[rows[column_order]],
++            column_starts,
++        )
++        log_v = exponent * (log_target - column_sum)
++        final_error = float(max(
++            np.max(np.abs(log_u - previous_u)),
++            np.max(np.abs(log_v - previous_v)),
++        ))
++        if not np.isfinite(final_error):
++            raise RuntimeError("UOT log-domain iteration produced non-finite potentials")
++        if final_error <= tolerance:
++            break
++    else:
++        raise RuntimeError(
++            f"UOT log-domain solver did not converge within {max_iterations} iterations; "
++            f"finalError={final_error}"
++        )
++    weights = np.exp(log_kernel + log_u[rows] + log_v[columns])
++    return SparsePlan(rows, columns, weights, row_starts), iteration, final_error
++
++
++def _matching_cost(
++    frame: Frame,
++    source: list[Node],
++    target: list[Node],
++    depth: int,
++    rows: np.ndarray,
++    columns: np.ndarray,
++    config: SolverConfig,
++) -> np.ndarray:
++    """Build the normalized cell-pair cost; disabled signals stay unevaluated."""
++    x = np.stack([node.center for node in source])
++    y = np.stack([node.center for node in target])
++    cell_side = frame.side_mm / (1 << depth)
++    cost = np.zeros(len(rows), dtype=np.float64)
++    if config.position_weight > 0:
++        cost += config.position_weight * position_cost(x, y, rows, columns, cell_side)
++    if config.normal_weight > 0:
++        source_normals = np.stack([node.normal for node in source])
++        target_normals = np.stack([node.normal for node in target])
++        cost += config.normal_weight * normal_cost(source_normals, target_normals, rows, columns)
++    if config.neighborhood_weight > 0:
++        source_neighborhood = _occupancy_descriptors(
++            source, depth, config.neighborhood_radius_cells
++        )
++        target_neighborhood = _occupancy_descriptors(
++            target, depth, config.neighborhood_radius_cells
++        )
++        cost += config.neighborhood_weight * neighborhood_cost(
++            source_neighborhood, target_neighborhood, rows, columns
++        )
++    return cost
++
++
++def _require_finite_plan(plan: SparsePlan, depth: int) -> None:
++    if not np.all(np.isfinite(plan.weights)) or float(plan.weights.sum()) <= 0:
++        raise RuntimeError(f"depth {depth} UOT solver returned no finite transported mass")
++
++
++def _solve_level(
++    frame: Frame,
++    source: list[Node],
++    target: list[Node],
++    depth: int,
++    rows: np.ndarray,
++    columns: np.ndarray,
++    config: SolverConfig,
++) -> tuple[SparsePlan, int, float]:
++    epsilon, rho = scales(
++        depth, config.max_depth, config.blur_cells, config.unmatched_penalty_cells
++    )
++    cost = _matching_cost(frame, source, target, depth, rows, columns, config)
++    source_mass = np.asarray([node.mass for node in source], dtype=np.float64)
++    target_mass = np.asarray([node.mass for node in target], dtype=np.float64)
++    plan, iterations, final_error = _log_sinkhorn(
++        source_mass,
++        target_mass,
++        rows,
++        columns,
++        cost,
++        epsilon,
++        rho,
++        config.max_iterations,
++        config.tolerance,
++    )
++    _require_finite_plan(plan, depth)
++    return plan, iterations, final_error
++
++
++def _support(plan: SparsePlan, source: list[Node], target: list[Node], relative: float) -> set[tuple[int, int]]:
++    support: set[tuple[int, int]] = set()
++    ends = np.r_[plan.row_starts[1:], len(plan.rows)]
++    for i, (start, end) in enumerate(zip(plan.row_starts, ends, strict=True)):
++        row = plan.weights[start:end]
++        maximum = float(row.max(initial=0.0))
++        if maximum <= 0:
++            continue
++        for offset in np.flatnonzero(row >= maximum * relative):
++            j = int(plan.columns[start + int(offset)])
++            support.add((source[i].prefix, target[j].prefix))
++    return support
++
++
++def _node_evidence(
++    source: list[Node],
++    target: list[Node],
++    plan: SparsePlan,
++) -> list[NodeEvidence]:
++    evidence: list[NodeEvidence] = []
++    target_centers = np.stack([node.center for node in target])
++    ends = np.r_[plan.row_starts[1:], len(plan.rows)]
++    for node, start, end in zip(source, plan.row_starts, ends, strict=True):
++        row = plan.weights[start:end]
++        target_indices = plan.columns[start:end]
++        mass = float(row.sum())
++        if mass <= 0:
++            evidence.append(NodeEvidence(0.0, None, None))
++            continue
++        probabilities = row / mass
++        row_centers = target_centers[target_indices]
++        barycenter = probabilities @ row_centers
++        variance = float(np.sum(probabilities * np.sum((row_centers - barycenter) ** 2, axis=1)))
++        evidence.append(NodeEvidence(
++            mass / node.mass,
++            barycenter - node.center,
++            math.sqrt(max(variance, 0.0)),
++        ))
++    return evidence
++
++
++def _target_marginal_ratios(target: list[Node], plan: SparsePlan) -> np.ndarray:
++    received = np.bincount(plan.columns, weights=plan.weights, minlength=len(target))
++    return received / np.asarray([node.mass for node in target])
++
++
++def _level_report(
++    frame: Frame,
++    level: LevelEvidence,
++) -> dict[str, Any]:
++    cell_size = frame.side_mm / (1 << level.depth)
++    candidate_cells = []
++    for node, evidence in zip(level.source, level.candidate, strict=True):
++        candidate_cells.append({
++            "prefix": node.prefix,
++            "mass": node.mass,
++            "displacementMm": (
++                (
++                    evidence.displacement_mm
++                    + node.center
++                    - _cell_center(frame, node.prefix, level.depth)
++                ).tolist()
++                if evidence.displacement_mm is not None
++                else None
++            ),
++            "spreadCells": (
++                evidence.spread_mm / cell_size if evidence.spread_mm is not None else None
++            ),
++            "sourceMarginalRatio": evidence.source_marginal_ratio,
++        })
++    return {
++        "summary": {
++            "depth": level.depth,
++            "cellSizeMm": cell_size,
++            "candidateCellCount": len(level.source),
++            "gtCellCount": len(level.target),
++            "candidatePairCount": level.candidate_pair_count,
++            "supportPairCount": level.support_pair_count,
++            "iterations": level.iterations,
++            "solverError": level.solver_error,
++        },
++        "candidateCells": candidate_cells,
++        "gtCells": [
++            {
++                "prefix": node.prefix,
++                "mass": node.mass,
++                "targetMarginalRatio": float(ratio),
++            }
++            for node, ratio in zip(level.target, level.target_marginal_ratios, strict=True)
++        ],
++    }
++
++
++def map_octrees(data: MappingInput, config: SolverConfig) -> dict[str, Any]:
++    _validate_config(data.frame, config)
++    previous_support: set[tuple[int, int]] | None = None
++    level_evidence: list[LevelEvidence] = []
++    for depth in range(config.start_depth, config.max_depth + 1):
++        source = _aggregate(data.frame, data.candidate, depth)
++        target = _aggregate(data.frame, data.gt, depth)
++        rows, columns = _candidate_pairs(
++            source,
++            target,
++            depth,
++            previous_support,
++            config.halo_cells,
++            config.max_pairs,
++        )
++        plan, iterations, solver_error = _solve_level(
++            data.frame, source, target, depth, rows, columns, config
++        )
++        previous_support = _support(plan, source, target, config.support_relative)
++        level_evidence.append(LevelEvidence(
++            depth,
++            source,
++            target,
++            len(rows),
++            len(previous_support),
++            iterations,
++            solver_error,
++            _node_evidence(source, target, plan),
++            _target_marginal_ratios(target, plan),
++        ))
++    levels = [
++        _level_report(
++            data.frame,
++            level,
++        )
++        for level in level_evidence
++    ]
++    return {
++        "schema": OUTPUT_SCHEMA,
++        "frame": {
++            "minMm": list(data.frame.min_mm),
++            "sideMm": data.frame.side_mm,
++            "inputMaxDepth": data.frame.max_depth,
++        },
++        "solver": {
++            "kind": "multiscale-uot-sparse-hierarchical-log",
++            "startDepth": config.start_depth,
++            "resolvedDepth": config.max_depth,
++            "blurCells": config.blur_cells,
++            "positionWeight": config.position_weight,
++            "normalWeight": config.normal_weight,
++            "neighborhoodWeight": config.neighborhood_weight,
++            "neighborhoodRadiusCells": config.neighborhood_radius_cells,
++            "unmatchedPenaltyCells": config.unmatched_penalty_cells,
++            "supportRelative": config.support_relative,
++            "haloCells": config.halo_cells,
++            "maxPairs": config.max_pairs,
++        },
++        "levels": levels,
++    }
+diff --git a/experiments/octree-mapping/octree_mapping/mesh_adapter.py b/experiments/octree-mapping/octree_mapping/mesh_adapter.py
+new file mode 100644
+index 0000000..8e94a9e
+--- /dev/null
++++ b/experiments/octree-mapping/octree_mapping/mesh_adapter.py
+@@ -0,0 +1,204 @@
++"""Trusted mesh-to-surface-cell adapter for private shadow experiments."""
++
++from __future__ import annotations
++
++from collections import defaultdict
++from dataclasses import dataclass
++import struct
++from pathlib import Path
++
++import numpy as np
++from scipy.spatial import cKDTree
++
++
++@dataclass(frozen=True)
++class TriangleMesh:
++    triangles: np.ndarray
++
++    @property
++    def bounds(self) -> tuple[np.ndarray, np.ndarray]:
++        return self.triangles.min(axis=(0, 1)), self.triangles.max(axis=(0, 1))
++
++
++@dataclass(frozen=True)
++class SurfaceCell:
++    mass: float
++    normal: np.ndarray
++
++
++def load_obj(path: str | Path) -> TriangleMesh:
++    vertices: list[tuple[float, float, float]] = []
++    triangles: list[tuple[int, int, int]] = []
++    for line in Path(path).read_text(encoding="utf-8").splitlines():
++        if line.startswith("v "):
++            values = line.split()
++            vertices.append((float(values[1]), float(values[2]), float(values[3])))
++        elif line.startswith("f "):
++            indices = [int(value.split("/", 1)[0]) for value in line.split()[1:]]
++            resolved = [index - 1 if index > 0 else len(vertices) + index for index in indices]
++            triangles.extend((resolved[0], resolved[index], resolved[index + 1])
++                             for index in range(1, len(resolved) - 1))
++    points = np.asarray(vertices, dtype=np.float64)
++    return TriangleMesh(points[np.asarray(triangles, dtype=np.int64)])
++
++
++def load_stl(path: str | Path) -> TriangleMesh:
++    data = Path(path).read_bytes()
++    if len(data) >= 84:
++        count = struct.unpack_from("<I", data, 80)[0]
++        if 84 + count * 50 == len(data):
++            values = np.ndarray(
++                shape=(count, 12), dtype="<f4", buffer=data, offset=84,
++                strides=(50, 4),
++            )
++            return TriangleMesh(values[:, 3:12].astype(np.float64).reshape(-1, 3, 3))
++    vertices: list[tuple[float, float, float]] = []
++    for line in data.decode("utf-8").splitlines():
++        words = line.split()
++        if words[:1] == ["vertex"]:
++            vertices.append(tuple(map(float, words[1:4])))
++    return TriangleMesh(np.asarray(vertices, dtype=np.float64).reshape(-1, 3, 3))
++
++
++def uniform_bounds_transform_values(
++    raw_min: np.ndarray,
++    raw_max: np.ndarray,
++    normalized_min: np.ndarray,
++    normalized_max: np.ndarray,
++) -> tuple[float, np.ndarray]:
++    ratios = (normalized_max - normalized_min) / (raw_max - raw_min)
++    scale = float(np.mean(ratios))
++    if float(np.max(np.abs(ratios - scale))) > 5e-5:
++        raise ValueError(f"whole-mesh bounds do not prove a uniform transform: {ratios.tolist()}")
++    raw_center = (raw_min + raw_max) / 2.0
++    normalized_center = (normalized_min + normalized_max) / 2.0
++    offset = normalized_center - scale * raw_center
++    return scale, offset
++
++
++def uniform_bounds_transform(raw: TriangleMesh, normalized: TriangleMesh) -> tuple[float, np.ndarray]:
++    return uniform_bounds_transform_values(*raw.bounds, *normalized.bounds)
++
++
++def transform(mesh: TriangleMesh, scale: float, offset: np.ndarray) -> TriangleMesh:
++    return TriangleMesh(mesh.triangles * scale + offset)
++
++
++def load_mesh(path: str | Path) -> TriangleMesh:
++    return load_obj(path) if Path(path).suffix.lower() == ".obj" else load_stl(path)
++
++
++def normalize_mesh(raw: TriangleMesh, normalized: TriangleMesh) -> TriangleMesh:
++    scale, offset = uniform_bounds_transform(raw, normalized)
++    return transform(raw, scale, offset)
++
++
++def label_triangles_by_nearest_part(
++    mesh: TriangleMesh,
++    parts: dict[str, TriangleMesh],
++) -> np.ndarray:
++    names = sorted(parts)
++    samples: list[np.ndarray] = []
++    labels: list[np.ndarray] = []
++    for index, name in enumerate(names):
++        triangles = parts[name].triangles
++        points = np.concatenate((triangles.reshape(-1, 3), triangles.mean(axis=1)), axis=0)
++        samples.append(points)
++        labels.append(np.full(len(points), index, dtype=np.int32))
++    sample_points = np.concatenate(samples, axis=0)
++    sample_labels = np.concatenate(labels, axis=0)
++    nearest = cKDTree(sample_points).query(mesh.triangles.mean(axis=1), workers=-1)[1]
++    return np.asarray([names[index] for index in sample_labels[nearest]], dtype=object)
++
++
++def _triangle_hits_box(triangle: np.ndarray, center: np.ndarray, half: float) -> bool:
++    vertices = triangle - center
++    if np.any(vertices.min(axis=0) > half) or np.any(vertices.max(axis=0) < -half):
++        return False
++    edges = (vertices[1] - vertices[0], vertices[2] - vertices[1], vertices[0] - vertices[2])
++    normal = np.cross(edges[0], edges[1])
++    projected = vertices @ normal
++    radius = half * float(np.sum(np.abs(normal)))
++    if float(projected.min()) > radius or float(projected.max()) < -radius:
++        return False
++    axes = np.eye(3)
++    for edge in edges:
++        for box_axis in axes:
++            axis = np.cross(edge, box_axis)
++            projected = vertices @ axis
++            radius = half * float(np.sum(np.abs(axis)))
++            if float(projected.min()) > radius or float(projected.max()) < -radius:
++                return False
++    return True
++
++
++def morton_prefix(x: int, y: int, z: int, depth: int) -> int:
++    prefix = 0
++    for shift in range(depth - 1, -1, -1):
++        prefix = (prefix << 3) | (((x >> shift) & 1) << 2) | (((y >> shift) & 1) << 1) | ((z >> shift) & 1)
++    return prefix
++
++
++def rasterize_surface_cells(
++    mesh: TriangleMesh,
++    root_min: np.ndarray,
++    root_side: float,
++    depth: int,
++) -> tuple[dict[int, float], dict[int, np.ndarray]]:
++    resolution = 1 << depth
++    cell_side = root_side / resolution
++    half = cell_side / 2.0
++    masses: dict[int, float] = defaultdict(float)
++    normal_sums: dict[int, np.ndarray] = defaultdict(lambda: np.zeros(3, dtype=np.float64))
++    for triangle in mesh.triangles:
++        tri_min = triangle.min(axis=0)
++        tri_max = triangle.max(axis=0)
++        low = np.floor((tri_min - root_min) / cell_side).astype(np.int64)
++        high = np.floor((tri_max - root_min) / cell_side).astype(np.int64)
++        low = np.clip(low, 0, resolution - 1)
++        high = np.clip(high, 0, resolution - 1)
++        hits: list[int] = []
++        for x in range(int(low[0]), int(high[0]) + 1):
++            for y in range(int(low[1]), int(high[1]) + 1):
++                for z in range(int(low[2]), int(high[2]) + 1):
++                    center = root_min + (np.asarray((x, y, z)) + 0.5) * cell_side
++                    if _triangle_hits_box(triangle, center, half):
++                        hits.append(morton_prefix(x, y, z, depth))
++        area_vector = np.cross(triangle[1] - triangle[0], triangle[2] - triangle[0])
++        area = float(np.linalg.norm(area_vector) / 2.0)
++        if area == 0:
++            continue
++        unit_normal = area_vector / (2.0 * area)
++        contribution = area / len(hits)
++        for prefix in hits:
++            masses[prefix] += contribution
++            normal_sums[prefix] += contribution * unit_normal
++    return masses, normal_sums
++
++
++def aggregate_surface_cells(
++    masses: dict[int, float], normal_sums: dict[int, np.ndarray]
++) -> dict[int, SurfaceCell]:
++    return {
++        prefix: SurfaceCell(mass, normal_sums[prefix] / mass)
++        for prefix, mass in masses.items()
++        if mass > 0
++    }
++
++
++def surface_cells(
++    mesh: TriangleMesh,
++    root_min: np.ndarray,
++    root_side: float,
++    depth: int,
++) -> dict[int, SurfaceCell]:
++    return aggregate_surface_cells(*rasterize_surface_cells(mesh, root_min, root_side, depth))
++
++
++def load_part_manifest(path: str | Path) -> dict[str, Path]:
++    parts: dict[str, Path] = {}
++    lines = Path(path).read_text(encoding="utf-8").splitlines()
++    for line in lines[1:]:
++        name, _red, _green, _blue, stl_path = line.split("\t")
++        parts[name] = Path(stl_path)
++    return parts
+diff --git a/experiments/octree-mapping/octree_mapping/unmatched.py b/experiments/octree-mapping/octree_mapping/unmatched.py
+new file mode 100644
+index 0000000..6665e96
+--- /dev/null
++++ b/experiments/octree-mapping/octree_mapping/unmatched.py
+@@ -0,0 +1,8 @@
++"""Unbalanced transport scale calculations."""
++
++from __future__ import annotations
++
++
++def scales(depth: int, max_depth: int, blur_cells: float, unmatched_penalty_cells: float) -> tuple[float, float]:
++    scale_to_finest = 1 << (max_depth - depth)
++    return blur_cells ** 2, (unmatched_penalty_cells / scale_to_finest) ** 2
+diff --git a/experiments/octree-mapping/prepare_plan4_shadow.py b/experiments/octree-mapping/prepare_plan4_shadow.py
+new file mode 100644
+index 0000000..b5cad67
+--- /dev/null
++++ b/experiments/octree-mapping/prepare_plan4_shadow.py
+@@ -0,0 +1,133 @@
++"""Prepare the retained Plan 4 transformer robot for the private shadow mapper."""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++import resource
++import time
++
++import numpy as np
++
++from octree_mapping.mesh_adapter import (
++    SurfaceCell,
++    TriangleMesh,
++    load_obj,
++    load_part_manifest,
++    load_stl,
++    label_triangles_by_nearest_part,
++    surface_cells,
++    transform,
++    uniform_bounds_transform,
++    uniform_bounds_transform_values,
++)
++
++
++def bounds(mesh) -> dict[str, list[float]]:
++    minimum, maximum = mesh.bounds
++    return {"min": minimum.tolist(), "max": maximum.tolist(), "size": (maximum - minimum).tolist()}
++
++
++def parser() -> argparse.ArgumentParser:
++    result = argparse.ArgumentParser(description="Prepare private Plan 4 depth-6 surface cells")
++    result.add_argument("--gt-obj", required=True)
++    result.add_argument("--candidate-obj", required=True)
++    result.add_argument("--candidate-stl", required=True)
++    result.add_argument("--parts-meta", required=True)
++    result.add_argument("--output", required=True)
++    result.add_argument("--metadata", required=True)
++    result.add_argument("--depth", type=int, default=6)
++    return result
++
++
++def main() -> None:
++    args = parser().parse_args()
++    started = time.perf_counter()
++    root_min = np.asarray((-1.0, -1.0, -1.0))
++    root_side = 2.0
++
++    gt = load_obj(args.gt_obj)
++    candidate = load_obj(args.candidate_obj)
++    candidate_stl = load_stl(args.candidate_stl)
++    canonical_scale, canonical_offset = uniform_bounds_transform(candidate_stl, candidate)
++    if abs(canonical_scale - 1.0) > 5e-5 or float(np.max(np.abs(canonical_offset))) > 5e-5:
++        raise ValueError("final candidate STL and OBJ do not share the same canonical frame")
++    gt_cells = surface_cells(gt, root_min, root_side, args.depth)
++    candidate_cells = surface_cells(candidate, root_min, root_side, args.depth)
++    part_paths = load_part_manifest(args.parts_meta)
++    part_meshes = {name: load_stl(path) for name, path in sorted(part_paths.items())}
++    raw_min = np.min(np.stack([mesh.bounds[0] for mesh in part_meshes.values()]), axis=0)
++    raw_max = np.max(np.stack([mesh.bounds[1] for mesh in part_meshes.values()]), axis=0)
++    scale, offset = uniform_bounds_transform_values(raw_min, raw_max, *candidate.bounds)
++    normalized_parts = {name: transform(mesh, scale, offset) for name, mesh in part_meshes.items()}
++    triangle_labels = label_triangles_by_nearest_part(candidate, normalized_parts)
++    part_cells: dict[str, dict[int, SurfaceCell]] = {}
++    part_triangles: dict[str, int] = {}
++    for name, path in sorted(part_paths.items()):
++        part_triangles[name] = int(np.count_nonzero(triangle_labels == name))
++        part_cells[name] = surface_cells(
++            TriangleMesh(candidate.triangles[triangle_labels == name]),
++            root_min,
++            root_side,
++            args.depth,
++        )
++
++    provenance: dict[int, list[dict[str, float | str]]] = {}
++    for prefix in sorted(candidate_cells):
++        contributions = [(name, cells[prefix].mass) for name, cells in part_cells.items() if prefix in cells]
++        total = sum(value for _, value in contributions)
++        provenance[prefix] = [{"name": name, "weight": value / total} for name, value in contributions]
++
++    document = {
++        "schema": "procedura.octree-mapping-input/2",
++        "frame": {"minMm": root_min.tolist(), "sideMm": root_side, "maxDepth": args.depth},
++        "gt": {"cells": [
++            {"prefix": prefix, "mass": cell.mass, "normal": cell.normal.tolist()}
++            for prefix, cell in sorted(gt_cells.items())
++        ]},
++        "candidate": {"cells": [
++            {
++                "prefix": prefix,
++                "mass": cell.mass,
++                "normal": cell.normal.tolist(),
++                "parts": provenance[prefix],
++            }
++            for prefix, cell in sorted(candidate_cells.items())
++        ]},
++    }
++    Path(args.output).write_text(json.dumps(document, separators=(",", ":")) + "\n", encoding="utf-8")
++    peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
++    metadata = {
++        "frame": {"minMm": root_min.tolist(), "sideMm": root_side, "depth": args.depth},
++        "inputs": {
++            "gtObj": str(Path(args.gt_obj).resolve()),
++            "candidateObj": str(Path(args.candidate_obj).resolve()),
++            "candidateStl": str(Path(args.candidate_stl).resolve()),
++            "partsMeta": str(Path(args.parts_meta).resolve()),
++        },
++        "triangles": {
++            "gt": len(gt.triangles),
++            "candidate": len(candidate.triangles),
++            "parts": part_triangles,
++        },
++        "bounds": {
++            "gt": bounds(gt),
++            "candidate": bounds(candidate),
++            "candidateStl": bounds(candidate_stl),
++            "partsRawUnion": {"min": raw_min.tolist(), "max": raw_max.tolist(), "size": (raw_max - raw_min).tolist()},
++        },
++        "canonicalStlToObj": {"scale": canonical_scale, "offset": canonical_offset.tolist()},
++        "partStlToCanonical": {"scale": scale, "offset": offset.tolist()},
++        "provenanceMethod": "nearest retained part surface sample per final candidate triangle",
++        "normalMethod": "oriented triangle unit normals averaged by per-cell surface-area contribution",
++        "cells": {"gt": len(gt_cells), "candidate": len(candidate_cells)},
++        "parts": {name: {"path": str(path), "cells": len(part_cells[name])} for name, path in sorted(part_paths.items())},
++        "elapsedSeconds": time.perf_counter() - started,
++        "peakRssBytes": int(peak_rss),
++    }
++    Path(args.metadata).write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/experiments/octree-mapping/pyproject.toml b/experiments/octree-mapping/pyproject.toml
+new file mode 100644
+index 0000000..5d38544
+--- /dev/null
++++ b/experiments/octree-mapping/pyproject.toml
+@@ -0,0 +1,20 @@
++[build-system]
++requires = ["setuptools>=75"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "procedura-octree-mapping"
++version = "0.1.0"
++description = "Shadow-only multiscale unbalanced-OT validation for occupied octrees"
++requires-python = ">=3.12"
++dependencies = [
++  "numpy==2.5.2",
++  "scipy==1.18.1",
++]
++
++[project.scripts]
++procedura-octree-map = "octree_mapping.cli:main"
++
++[tool.setuptools.packages.find]
++where = ["."]
++include = ["octree_mapping*"]
+diff --git a/experiments/octree-mapping/run_plan4_ablation.py b/experiments/octree-mapping/run_plan4_ablation.py
+new file mode 100644
+index 0000000..ed2a9d5
+--- /dev/null
++++ b/experiments/octree-mapping/run_plan4_ablation.py
+@@ -0,0 +1,78 @@
++"""Run the frozen Plan 4 geometric-signal ablation and summarize private reports."""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++import subprocess
++import sys
++
++PROFILES = (
++    ("position", 1.0, 0.0, 0.0, 8.0),
++    ("normal", 1.0, 1.0, 0.0, 8.0),
++    ("neighborhood", 1.0, 1.0, 1.0, 8.0),
++    ("unmatched", 1.0, 1.0, 1.0, 2.0),
++)
++
++
++def parser() -> argparse.ArgumentParser:
++    result = argparse.ArgumentParser(description="Run frozen Plan 4 mapping ablation")
++    result.add_argument("--input", required=True)
++    result.add_argument("--output-dir", required=True)
++    result.add_argument("--summary", required=True)
++    return result
++
++
++def resolved_level(report: dict) -> dict:
++    return report["levels"][-1]
++
++
++def summarize(report: dict) -> dict:
++    level = resolved_level(report)
++    candidate_ratios = [node["sourceMarginalRatio"] for node in level["candidateCells"]]
++    gt_ratios = [node["targetMarginalRatio"] for node in level["gtCells"]]
++    return {
++        "solver": report["solver"],
++        "levels": report["levels"],
++        "runtime": report["runtime"],
++        "marginalRanges": {
++            "candidate": [min(candidate_ratios), max(candidate_ratios)],
++            "gt": [min(gt_ratios), max(gt_ratios)],
++        },
++    }
++
++
++def main() -> None:
++    args = parser().parse_args()
++    output_dir = Path(args.output_dir)
++    output_dir.mkdir(parents=True, exist_ok=True)
++    profiles = {}
++    for name, position, normal, neighborhood, unmatched in PROFILES:
++        report_path = output_dir / f"{name}.json"
++        subprocess.run(
++            [
++                sys.executable, "-m", "octree_mapping",
++                "--input", args.input,
++                "--output", str(report_path),
++                "--position-weight", str(position),
++                "--normal-weight", str(normal),
++                "--neighborhood-weight", str(neighborhood),
++                "--neighborhood-radius-cells", "1",
++                "--unmatched-penalty-cells", str(unmatched),
++            ],
++            check=True,
++        )
++        report = json.loads(report_path.read_text(encoding="utf-8"))
++        profiles[name] = {"privateReport": str(report_path.resolve()), **summarize(report)}
++    result = {
++        "schema": "procedura.octree-mapping-plan4-ablation/2",
++        "privateInput": str(Path(args.input).resolve()),
++        "profiles": profiles,
++        "classification": "not_recomputed_without_target_coupling",
++    }
++    Path(args.summary).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/experiments/octree-mapping/validate_scenarios.py b/experiments/octree-mapping/validate_scenarios.py
+new file mode 100644
+index 0000000..c106b24
+--- /dev/null
++++ b/experiments/octree-mapping/validate_scenarios.py
+@@ -0,0 +1,483 @@
++"""Black-box acceptance scenarios for the installed shadow CLI.
++
++This deliberately uses subprocess execution and observable JSON reports rather
++than the repository's unit-test framework.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++from typing import Callable
++
++
++SCHEMA = "procedura.octree-mapping-input/2"
++
++
++def morton(x: int, y: int, z: int, depth: int) -> int:
++    value = 0
++    for shift in range(depth - 1, -1, -1):
++        child = (((x >> shift) & 1) << 2) | (((y >> shift) & 1) << 1) | ((z >> shift) & 1)
++        value = (value << 3) | child
++    return value
++
++
++def decode(prefix: int, depth: int) -> tuple[int, int, int]:
++    xyz = [0, 0, 0]
++    for shift in range(depth - 1, -1, -1):
++        child = (prefix >> (3 * shift)) & 7
++        xyz[0] = (xyz[0] << 1) | ((child >> 2) & 1)
++        xyz[1] = (xyz[1] << 1) | ((child >> 1) & 1)
++        xyz[2] = (xyz[2] << 1) | (child & 1)
++    return xyz[0], xyz[1], xyz[2]
++
++
++def document(
++    depth: int,
++    gt: list[tuple[int, int, int]],
++    candidate: list[tuple[int, int, int, str]],
++) -> dict:
++    return {
++        "schema": SCHEMA,
++        "frame": {"minMm": [0, 0, 0], "sideMm": float(1 << depth), "maxDepth": depth},
++        "gt": {"cells": [
++            {"prefix": morton(*xyz, depth), "mass": 1.0, "normal": [0.0, 0.0, 1.0]}
++            for xyz in gt
++        ]},
++        "candidate": {"cells": [
++            {
++                "prefix": morton(x, y, z, depth),
++                "mass": 1.0,
++                "normal": [0.0, 0.0, 1.0],
++                "parts": [{"name": part, "weight": 1.0}],
++            }
++            for x, y, z, part in candidate
++        ]},
++    }
++
++
++def run_case(
++    name: str,
++    value: dict,
++    depth: int,
++    check: Callable[[dict], None],
++    arguments: tuple[str, ...] = (),
++) -> None:
++    with tempfile.TemporaryDirectory(prefix=f"octree-map-{name}-") as directory:
++        root = Path(directory)
++        input_path = root / "input.json"
++        output_path = root / "report.json"
++        input_path.write_text(json.dumps(value), encoding="utf-8")
++        subprocess.run(
++            [
++                sys.executable,
++                "-m",
++                "octree_mapping",
++                "--input",
++                str(input_path),
++                "--output",
++                str(output_path),
++                "--max-depth",
++                str(depth),
++                "--unmatched-penalty-cells",
++                "8",
++            "--blur-cells",
++            "0.35",
++                "--max-pairs",
++                "1000000",
++                *arguments,
++            ],
++            check=True,
++        )
++        report = json.loads(output_path.read_text(encoding="utf-8"))
++        validate_compact_levels(report)
++        check(report)
++        print(f"PASS {name}")
++
++
++def run_failure(name: str, value: dict, arguments: list[str], message: str) -> None:
++    with tempfile.TemporaryDirectory(prefix=f"octree-map-{name}-") as directory:
++        root = Path(directory)
++        input_path = root / "input.json"
++        output_path = root / "report.json"
++        input_path.write_text(json.dumps(value), encoding="utf-8")
++        result = subprocess.run(
++            [
++                sys.executable,
++                "-m",
++                "octree_mapping",
++                "--input",
++                str(input_path),
++                "--output",
++                str(output_path),
++                *arguments,
++            ],
++            check=False,
++            capture_output=True,
++            text=True,
++        )
++        require(result.returncode != 0 and message in result.stderr, f"{name} must fail with {message!r}")
++        require(not output_path.exists(), f"{name} must not publish a report")
++        print(f"PASS {name}")
++
++
++def resolved_level(report: dict) -> dict:
++    return report["levels"][-1]
++
++
++def validate_compact_levels(report: dict) -> None:
++    summary_keys = {
++        "depth", "cellSizeMm", "candidateCellCount", "gtCellCount",
++        "candidatePairCount", "supportPairCount", "iterations", "solverError",
++    }
++    candidate_keys = {
++                "prefix", "mass", "displacementMm", "spreadCells",
++        "sourceMarginalRatio",
++    }
++    gt_keys = {"prefix", "mass", "targetMarginalRatio"}
++    levels = report["levels"]
++    require(
++        report["schema"] == "procedura.octree-mapping-report/3",
++        "report must publish schema /3",
++    )
++    require(
++        "candidateNodes" not in report and "gtNodes" not in report,
++        "schema /3 must not retain final-only verbose node arrays",
++    )
++    require(
++        [level["summary"]["depth"] for level in levels]
++        == list(range(report["solver"]["startDepth"], report["solver"]["resolvedDepth"] + 1)),
++        "levels must cover every solved depth",
++    )
++    previous_candidate: set[int] | None = None
++    previous_gt: set[int] | None = None
++    for level in levels:
++        require(
++            set(level) == {"summary", "candidateCells", "gtCells"},
++            "level wrapper fields must match the compact contract",
++        )
++        summary = level["summary"]
++        candidate = level["candidateCells"]
++        gt = level["gtCells"]
++        require(set(summary) == summary_keys, "level summary fields must match the compact contract")
++        require(
++            all(set(cell) == candidate_keys for cell in candidate),
++            "candidate cell fields must match the compact contract",
++        )
++        require(
++            all(set(cell) == gt_keys for cell in gt),
++            "GT cell fields must match the compact contract",
++        )
++        require(
++            len(candidate) == summary["candidateCellCount"]
++            and len(gt) == summary["gtCellCount"],
++            "compact cell arrays must match their summary counts",
++        )
++        require(
++            all(
++                cell["displacementMm"] is None or len(cell["displacementMm"]) == 3
++                for cell in candidate
++            ),
++            "displacementMm must remain a three-component millimetre vector",
++        )
++        candidate_prefixes = {cell["prefix"] for cell in candidate}
++        gt_prefixes = {cell["prefix"] for cell in gt}
++        if previous_candidate is not None:
++            require(
++                all(prefix >> 3 in previous_candidate for prefix in candidate_prefixes)
++                and all(prefix >> 3 in previous_gt for prefix in gt_prefixes),
++                "fine prefixes must have derivable parents at the previous depth",
++            )
++        previous_candidate = candidate_prefixes
++        previous_gt = gt_prefixes
++
++
++def axis_values(level: dict, axis: int) -> list[float]:
++    nodes = [node for node in level["candidateCells"] if node["displacementMm"] is not None]
++    return [node["displacementMm"][axis] for node in nodes]
++
++
++def grid_center(report: dict, level: dict, prefix: int) -> list[float]:
++    depth = level["summary"]["depth"]
++    cell_size = level["summary"]["cellSizeMm"]
++    xyz = decode(prefix, depth)
++    return [
++        report["frame"]["minMm"][axis] + (xyz[axis] + 0.5) * cell_size
++        for axis in range(3)
++    ]
++
++
++def displacement(report: dict, prefix: int) -> list[float]:
++    return next(
++        node["displacementMm"]
++        for node in resolved_level(report)["candidateCells"]
++        if node["prefix"] == prefix
++    )
++
++
++def max_displacement(report: dict) -> float:
++    return max(
++        sum(component * component for component in node["displacementMm"]) ** 0.5
++        for node in resolved_level(report)["candidateCells"]
++        if node["displacementMm"] is not None
++    )
++
++
++def require(condition: bool, message: str) -> None:
++    if not condition:
++        raise AssertionError(message)
++
++
++def main() -> None:
++    identical = [(x, y, 4) for x in range(5, 8) for y in range(5, 8)]
++    run_case(
++        "identity",
++        document(4, identical, [(x, y, z, "block") for x, y, z in identical]),
++        4,
++        lambda report: require(
++            max_displacement(report) < 0.1,
++            "identity must resolve every node to zero displacement",
++        ),
++    )
++
++    translated_gt = [(x, 8 + (x % 3), 8) for x in (6, 9, 12, 15)]
++    translated_candidate = [(x + 1, y, z, "panel") for x, y, z in translated_gt]
++    run_case(
++        "translated-pattern",
++        document(5, translated_gt, translated_candidate),
++        5,
++        lambda report: require(
++            all(abs(value + 1.0) < 0.35 for value in axis_values(resolved_level(report), 0)),
++            "translated pattern must map one cell back",
++        ),
++    )
++
++    translated_cube = [(8, 16, 16)]
++    run_case(
++        "multidepth-mm-displacement",
++        document(
++            6,
++            translated_cube,
++            [(x + 8, y, z, "translated_cube") for x, y, z in translated_cube],
++        ),
++        6,
++        lambda report: require(
++            all(
++                all(
++                    abs(value + 8.0) <= level["summary"]["cellSizeMm"] / 2.0 + 1e-9
++                    for value in axis_values(level, 0)
++                )
++                for level in report["levels"]
++            ),
++            "the same translation must remain comparable in millimetres at every depth",
++        ),
++    )
++
++    def grid_center_reconstruction(report: dict) -> None:
++        expected_barycenter = [5.5, 1.5, 1.5]
++        for level in report["levels"]:
++            cell = level["candidateCells"][0]
++            center = grid_center(report, level, cell["prefix"])
++            reconstructed = [
++                center[axis] + cell["displacementMm"][axis]
++                for axis in range(3)
++            ]
++            require(
++                all(
++                    abs(reconstructed[axis] - expected_barycenter[axis]) < 1e-9
++                    for axis in range(3)
++                ),
++                "grid center plus displacement must reconstruct the GT barycenter",
++            )
++
++    run_case(
++        "grid-center-reconstruction",
++        document(4, [(5, 1, 1)], [(1, 1, 1, "partial_cell")]),
++        4,
++        grid_center_reconstruction,
++    )
++
++    leg_shape = [(0, y, z) for y in range(10, 13) for z in range(3, 12)]
++    gt_legs = [(9 + x, y, z) for x, y, z in leg_shape] + [(22 + x, y, z) for x, y, z in leg_shape]
++    candidate_legs = (
++        [(8 + x, y, z, "left_leg") for x, y, z in leg_shape]
++        + [(23 + x, y, z, "right_leg") for x, y, z in leg_shape]
++    )
++    run_case(
++        "wide-legs",
++        document(5, gt_legs, candidate_legs),
++        5,
++        lambda report: require(
++            all(
++                cell["displacementMm"][0] > 0.5
++                for cell in resolved_level(report)["candidateCells"]
++                if decode(cell["prefix"], 5)[0] < 16
++            )
++            and all(
++                cell["displacementMm"][0] < -0.5
++                for cell in resolved_level(report)["candidateCells"]
++                if decode(cell["prefix"], 5)[0] >= 16
++            ),
++            "wide legs must receive opposed inward motion",
++        ),
++    )
++
++    body = [(x, y, 8) for x in range(12, 16) for y in range(12, 16)]
++    armour = [(x, 24, z) for x in range(12, 16) for z in range(12, 16)]
++
++    def missing_armour(report: dict) -> None:
++        ratios = {
++            node["prefix"]: node["targetMarginalRatio"]
++            for node in resolved_level(report)["gtCells"]
++        }
++        body_ratio = sum(ratios[morton(*xyz, 5)] for xyz in body) / len(body)
++        armour_ratio = sum(ratios[morton(*xyz, 5)] for xyz in armour) / len(armour)
++        require(armour_ratio < body_ratio * 0.5, "missing armour must retain lower GT support than the body")
++
++    run_case(
++        "missing-armour",
++        document(5, body + armour, [(x, y, z, "torso") for x, y, z in body]),
++        5,
++        missing_armour,
++    )
++
++    island = [(27, y, z, "island") for y in range(24, 27) for z in range(24, 27)]
++
++    def extra_island(report: dict) -> None:
++        cells = resolved_level(report)["candidateCells"]
++        torso_cells = [cell for cell in cells if decode(cell["prefix"], 5)[0] < 20]
++        island_cells = [cell for cell in cells if decode(cell["prefix"], 5)[0] >= 20]
++        require(
++            island_cells and torso_cells
++            and max(cell["sourceMarginalRatio"] for cell in island_cells)
++            < 0.5 * min(cell["sourceMarginalRatio"] for cell in torso_cells),
++            "each extra-island cell must retain lower support than each torso cell",
++        )
++
++    run_case(
++        "extra-island",
++        document(5, body, [(x, y, z, "torso") for x, y, z in body] + island),
++        5,
++        extra_island,
++    )
++
++    boundary_gt = (
++        [(15, y, 6) for y in range(8, 12)]
++        + [(19, y, 6) for y in range(8, 12)]
++    )
++    boundary_candidate = (
++        [(16, y, 6, "bar") for y in range(8, 12)]
++        + [(19, y, 6, "bar") for y in range(8, 12)]
++    )
++
++    def coarse_recovery(report: dict) -> None:
++        crossed = displacement(report, morton(16, 8, 6, 5))[0]
++        stationary = displacement(report, morton(19, 8, 6, 5))[0]
++        require(
++            crossed < -0.5 and abs(stationary) < 0.35,
++            "fine level must split an ambiguous coarse aggregate across the boundary",
++        )
++
++    run_case(
++        "coarse-recovery",
++        document(5, boundary_gt, boundary_candidate),
++        5,
++        coarse_recovery,
++    )
++
++    mixed_gt = [(x - 1, y, z) for x, y, z in [(16, 8, 8), (17, 8, 8), (16, 10, 8)]]
++    mixed = document(
++        5,
++        mixed_gt,
++        [(16, 8, 8, "left_panel"), (17, 8, 8, "right_panel"), (16, 10, 8, "left_panel")],
++    )
++    mixed["candidate"]["cells"][0]["parts"] = [
++        {"name": "left_panel", "weight": 0.5},
++        {"name": "right_panel", "weight": 0.5},
++    ]
++
++    def mixed_provenance(report: dict) -> None:
++        cells = resolved_level(report)["candidateCells"]
++        require(
++            all(cell["displacementMm"][0] < -0.5 for cell in cells),
++            "cell-level displacement must remain available without part-level fitting",
++        )
++
++    run_case("mixed-provenance", mixed, 4, mixed_provenance)
++
++    depth8_gt = [(120, 120, 120), (121, 120, 120), (120, 121, 120)]
++    run_case(
++        "bounded-depth-8",
++        document(8, depth8_gt, [(x + 1, y, z, "fine") for x, y, z in depth8_gt]),
++        8,
++        lambda report: require(
++            report["solver"]["resolvedDepth"] == 8
++            and all(value < -0.5 for value in axis_values(resolved_level(report), 0)),
++            "bounded case must resolve at depth 8",
++        ),
++    )
++
++    normal_case = document(
++        4,
++        [(6, 8, 8), (10, 8, 8)],
++        [(8, 7, 8, "normal_probe"), (8, 9, 8, "normal_probe")],
++    )
++    normal_case["gt"]["cells"][0]["normal"] = [-1.0, 0.0, 0.0]
++    normal_case["gt"]["cells"][1]["normal"] = [1.0, 0.0, 0.0]
++    normal_case["candidate"]["cells"][0]["normal"] = [1.0, 0.0, 0.0]
++    normal_case["candidate"]["cells"][1]["normal"] = [-1.0, 0.0, 0.0]
++    run_case(
++        "normal-disambiguation",
++        normal_case,
++        4,
++        lambda report: (
++            require(
++                displacement(report, morton(8, 7, 8, 4))[0] > 0.5,
++                "matching +X normal must resolve an equal-position choice",
++            ),
++            require(
++                displacement(report, morton(8, 9, 8, 4))[0] < -0.5,
++                "matching -X normal must resolve the reciprocal equal-position choice",
++            ),
++        ),
++        ("--normal-weight", "1"),
++    )
++
++    neighborhood_case = document(
++        4,
++        [(8, 6, 8), (9, 6, 8), (8, 10, 8), (7, 10, 8)],
++        [
++            (6, 8, 8, "neighborhood_probe"),
++            (7, 8, 8, "neighborhood_probe"),
++            (10, 8, 8, "neighborhood_probe"),
++            (9, 8, 8, "neighborhood_probe"),
++        ],
++    )
++    run_case(
++        "neighborhood-disambiguation",
++        neighborhood_case,
++        4,
++        lambda report: require(
++            displacement(report, morton(6, 8, 8, 4))[1] > 0.5
++            and displacement(report, morton(10, 8, 8, 4))[1] < -0.5,
++            "reciprocal occupancy stencils must retain mirrored cell displacement",
++        ),
++        ("--neighborhood-weight", "8"),
++    )
++
++    invalid = document(4, identical, [(x, y, z, "block") for x, y, z in identical])
++    invalid["candidate"]["cells"][0]["parts"][0]["weight"] = 0.5
++    run_failure("invalid-contract", invalid, ["--max-depth", "4"], "part weights must sum to one")
++    run_failure(
++        "candidate-pair-limit",
++        document(4, identical, [(x, y, z, "block") for x, y, z in identical]),
++        ["--max-depth", "4", "--max-pairs", "2"],
++        "exceeding maxPairs=2",
++    )
++
++
++if __name__ == "__main__":
++    main()
