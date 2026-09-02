@@ -53,11 +53,13 @@ export interface RunProceduraOpts {
   /** When set, skip image-gen in the draft phase and use this image file as
    *  the reference (copied to <outputDir>/image.png). SCAD-gen still runs. */
   inputImage?: string;
-  /** Ordered provided views for incremental draft. The first is authoritative.
-   * The same set is reused by direct whole-model refine when enabled. */
-  inputImages?: readonly { label: string; path: string }[];
-  /** Host-produced plan.json for incremental draft; skips internal planning. */
-  inputPlan?: string;
+  /** Optional host-controlled execution context. Ordinary callers omit it. */
+  externalExecution?: {
+    inputImages?: readonly { label: string; path: string }[];
+    inputPlan?: string;
+    refineMode?: "direct" | "agent";
+    draftPromotion?: "standard" | "open-loop";
+  };
   /** Text-only: generate with NO reference image at all. Skips image-gen in the
    *  draft; refine and paint follow automatically by detecting the absent
    *  image.png. Incremental draft only — `runDraft` still needs an image. */
@@ -119,10 +121,6 @@ export interface RunProceduraOpts {
    * the final model: draft.{scad,stl,obj} are promoted to final.* and a
    * synthetic verdict="skipped" RefineResult is returned (no refine loop). */
   refine?: boolean;
-  /** Select the Phase 2 implementation. Defaults to PROCEDURA_REFINE_MODE, then direct. */
-  refineMode?: "direct" | "agent";
-  /** Promotion profile when refine is disabled. Default preserves normal Procedura artifacts. */
-  draftPromotion?: "standard" | "open-loop";
   /** Persist the binary STL deliverable (draft.stl / final.stl) alongside the
    * OBJ. Default false — only the normalized OBJ (+ SCAD) is exported; STL is
    * kept in internal build dirs for connectivity/rendering. */
@@ -303,12 +301,12 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
           outputDir: outDir,
           ...(opts.scadModel !== undefined ? { scadModel: opts.scadModel } : {}),
           ...(opts.imageModel !== undefined ? { imageModel: opts.imageModel } : {}),
-          ...(opts.inputImages !== undefined
-            ? { inputImages: opts.inputImages }
+          ...(opts.externalExecution?.inputImages !== undefined
+            ? { inputImages: opts.externalExecution.inputImages }
             : opts.inputImage !== undefined
               ? { inputImages: [{ label: "primary", path: opts.inputImage }] }
               : {}),
-          ...(opts.inputPlan !== undefined ? { inputPlan: opts.inputPlan } : {}),
+          ...(opts.externalExecution?.inputPlan !== undefined ? { inputPlan: opts.externalExecution.inputPlan } : {}),
           ...(opts.textOnly ? { textOnly: true } : {}),
           ...(opts.contextRenders ? { contextRenders: true } : {}),
           ...(opts.extraRefs !== undefined ? { extraRefs: opts.extraRefs } : {}),
@@ -350,14 +348,15 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
     if (opts.refine === false) {
       console.log(`\n--- Phase 2: refine SKIPPED (--no-refine) — promoting draft → final ---`);
       refineResult = await promoteDraftAsFinal(
-        outDir, writer.path, exportStl, opts.draftPromotion ?? "standard",
+        outDir, writer.path, exportStl,
+        opts.externalExecution?.draftPromotion ?? "standard",
       );
     } else {
       // Refine implementation. `direct` (the default) runs the fixed
       // context → critic → measure → patch → gate cycle as a pipeline; `agent`
       // is the historical seventeen-tool loop, kept for A/B until the benchmark
       // has ruled on the swap. PROCEDURA_REFINE_MODE=agent restores it.
-      const refineMode = opts.refineMode
+      const refineMode = opts.externalExecution?.refineMode
         ?? (process.env["PROCEDURA_REFINE_MODE"] === "agent" ? "agent" : "direct");
       console.log(`\n--- Phase 2: refine (${refineMode}) ---`);
       const refineOpts = {
@@ -373,7 +372,7 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
         ? await runRefine(refineOpts)
         : await runDirectRefine({
             ...refineOpts,
-            ...(opts.inputImages !== undefined ? { referenceImages: opts.inputImages } : {}),
+            ...(opts.externalExecution?.inputImages !== undefined ? { referenceImages: opts.externalExecution.inputImages } : {}),
           });
     }
 
