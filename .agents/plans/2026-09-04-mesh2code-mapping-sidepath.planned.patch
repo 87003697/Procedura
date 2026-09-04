@@ -1,0 +1,145 @@
+diff --git a/src/agents_mesh2code/mapping-feedback-schema.ts b/src/agents_mesh2code/mapping-feedback-schema.ts
+new file mode 100644
+--- /dev/null
++++ b/src/agents_mesh2code/mapping-feedback-schema.ts
+@@ -0,0 +1,35 @@
++/** Closed parser for Mapping Agent feedback. */
++export type FeedbackStatus = "ok" | "insufficient-evidence";
++export interface MappingFeedbackEvidence { id: string; kind: "part" | "region" | "overlay"; payload: Record<string, unknown>; }
++export interface MappingFeedbackIssue { partId: string; problem: string; direction: string; magnitudeRangeMm: { min: number; max: number } | null; confidence: number; evidenceIds: string[]; }
++export interface MappingFeedbackArtifact { schemaVersion: 1; status: FeedbackStatus; issues: MappingFeedbackIssue[]; evidence: MappingFeedbackEvidence[]; }
++const forbidden = new Set(["path", "mesh", "vertices", "faces", "source", "raw", "handle", "bytes", "material", "texture", "report", "target"]);
++function object(value: unknown, label: string): Record<string, unknown> { if (!value || typeof value !== "object" || Array.isArray(value)) throw Error(label); return value as Record<string, unknown>; }
++function finite(value: unknown, label: string): number { if (typeof value !== "number" || !Number.isFinite(value)) throw Error(label); return value; }
++function payloadValue(value: unknown): void { if (Array.isArray(value)) { value.forEach(payloadValue); return; } if (value && typeof value === "object") { for (const [key, child] of Object.entries(value)) { if (forbidden.has(key.toLowerCase())) throw Error("forbidden payload field"); payloadValue(child); } return; } if (typeof value === "number") finite(value, "invalid payload number"); }
++function payload(value: unknown): Record<string, unknown> { const item = object(value, "invalid payload"); payloadValue(item); return item; }
++export function parseMappingFeedbackArtifact(text: string): MappingFeedbackArtifact {
++  let raw: unknown; try { raw = JSON.parse(text); } catch { throw Error("invalid artifact JSON"); }
++  const root = object(raw, "invalid artifact"); const rootFields = ["schemaVersion", "status", "issues", "evidence"];
++  if (Object.keys(root).some((key) => !rootFields.includes(key))) throw Error("unknown artifact field");
++  if (root.schemaVersion !== 1 || (root.status !== "ok" && root.status !== "insufficient-evidence")) throw Error("invalid artifact header");
++  if (!Array.isArray(root.issues) || !Array.isArray(root.evidence)) throw Error("issues and evidence must be arrays");
++  const evidenceIds = new Set<string>();
++  const evidence = root.evidence.map((value) => { const item = object(value, "invalid evidence");
++    if (Object.keys(item).some((key) => !["id", "kind", "payload"].includes(key)) || typeof item.id !== "string" || !item.id || evidenceIds.has(item.id)) throw Error("invalid evidence");
++    if (!["part", "region", "overlay"].includes(String(item.kind))) throw Error("invalid evidence kind");
++    const result = { id: item.id, kind: item.kind as MappingFeedbackEvidence["kind"], payload: payload(item.payload) }; evidenceIds.add(item.id); return result;
++  });
++  const issueParts = new Set<string>();
++  const issues = root.issues.map((value): MappingFeedbackIssue => { const item = object(value, "invalid issue");
++    const fields = ["partId", "problem", "direction", "magnitudeRangeMm", "confidence", "evidenceIds"];
++    if (Object.keys(item).some((key) => !fields.includes(key)) || typeof item.partId !== "string" || !item.partId || issueParts.has(item.partId)) throw Error("invalid issue");
++    if (typeof item.problem !== "string" || !item.problem || typeof item.direction !== "string" || !item.direction) throw Error("invalid issue text");
++    const confidence = finite(item.confidence, "confidence"); if (confidence < 0 || confidence > 1) throw Error("confidence out of range");
++    if (!Array.isArray(item.evidenceIds) || item.evidenceIds.length === 0 || item.evidenceIds.some((id) => typeof id !== "string" || !evidenceIds.has(id))) throw Error("invalid evidence reference");
++    let range: { min: number; max: number } | null = null; if (item.magnitudeRangeMm !== null) { const value = object(item.magnitudeRangeMm, "invalid range"); if (Object.keys(value).some((key) => !["min", "max"].includes(key))) throw Error("unknown range field"); const min = finite(value.min, "range.min"); const max = finite(value.max, "range.max"); if (min < 0 || max < min || max > 1000) throw Error("invalid magnitude range"); range = { min, max }; }
++    issueParts.add(item.partId); return { partId: item.partId, problem: item.problem, direction: item.direction, magnitudeRangeMm: range, confidence, evidenceIds: [...item.evidenceIds] };
++  });
++  if ((root.status === "insufficient-evidence") !== (issues.length === 0)) throw Error("status does not match issues");
++  return { schemaVersion: 1, status: root.status, issues, evidence };
++}
++}
+diff --git a/src/tools_mesh2code/mapping-facts.ts b/src/tools_mesh2code/mapping-facts.ts
+new file mode 100644
+--- /dev/null
++++ b/src/tools_mesh2code/mapping-facts.ts
+@@ -0,0 +1,27 @@
++import type { JsonObject } from "@harness/template/types";
++import type { ToolDescriptor, ToolExecutor, ToolResult } from "@harness/template/tool";
++export interface MappingFactsSource { report: unknown; input: unknown }
++export interface MappingFactsTool { descriptor: ToolDescriptor; executor: ToolExecutor }
++const descriptor: ToolDescriptor = { name: "mapping_facts", description: "Read bounded finest-depth mapping cells; compute conclusions yourself.", owner: { kind: "core" }, inputSchema: { type: "object", additionalProperties: false, properties: { cursor: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1, maximum: 256 } } } satisfies JsonObject };
++function record(value: unknown, label: string): Record<string, unknown> { if (!value || typeof value !== "object" || Array.isArray(value)) throw Error(label); return value as Record<string, unknown>; }
++function number(value: unknown, label: string): number { if (typeof value !== "number" || !Number.isFinite(value)) throw Error(label); return value; }
++function center(min: number[], side: number, depth: number, prefix: number): number[] { const xyz = [0, 0, 0]; for (let shift = depth - 1; shift >= 0; shift--) { const child = (prefix >> (3 * shift)) & 7; for (let axis = 0; axis < 3; axis++) xyz[axis] = (xyz[axis]! << 1) | ((child >> (2 - axis)) & 1); } const size = side / 2 ** depth; return xyz.map((value, axis) => min[axis]! + (value + 0.5) * size); }
++export function makeMappingFactsTool(source: MappingFactsSource, maxCells = 10000): MappingFactsTool {
++  if (!Number.isInteger(maxCells) || maxCells < 1) throw Error("invalid cell budget");
++  const input = record(source.input, "invalid input"); const inputFrame = record(input.frame, "invalid input frame"); const report = record(source.report, "invalid report");
++  if (Object.keys(input).some((key) => !["candidate", "frame", "gt", "schema"].includes(key)) || Object.keys(inputFrame).some((key) => !["maxDepth", "minMm", "sideMm"].includes(key)) || Object.keys(report).some((key) => !["frame", "levels", "schema", "solver", "runtime"].includes(key))) throw Error("unknown mapping field");
++  if (input.schema !== "procedura.octree-mapping-input/2" || report.schema !== "procedura.octree-mapping-report/3") throw Error("unsupported mapping schema");
++  const min = inputFrame.minMm; const side = number(inputFrame.sideMm, "sideMm"); const maxDepth = number(inputFrame.maxDepth, "maxDepth");
++  if (!Array.isArray(min) || min.length !== 3 || min.some((value) => typeof value !== "number" || !Number.isFinite(value)) || side <= 0 || !Number.isInteger(maxDepth)) throw Error("invalid mapping frame");
++  const levels = report.levels; if (!Array.isArray(levels) || !levels.length) throw Error("mapping has no levels");
++  const level = levels.find((value) => { const item = record(value, "invalid level"); const summary = record(item.summary, "invalid summary"); return number(summary.depth, "depth") === maxDepth; });
++  if (!level) throw Error("finest level missing"); const cells = record(level, "invalid level").candidateCells;
++  if (!Array.isArray(cells) || cells.length > maxCells) throw Error("mapping cell budget exceeded");
++  const executor: ToolExecutor = { descriptor, async execute(raw: JsonObject): Promise<ToolResult> { try {
++    const query = record(raw, "invalid query"); if (Object.keys(query).some((key) => !["cursor", "limit"].includes(key))) throw Error("unknown query field"); const cursor = query.cursor === undefined ? 0 : number(query.cursor, "cursor"); const limit = query.limit === undefined ? 128 : number(query.limit, "limit");
++    if (!Number.isInteger(cursor) || cursor < 0 || !Number.isInteger(limit) || limit < 1 || limit > 256) throw Error("invalid pagination");
++    const page = cells.slice(cursor, cursor + limit).map((value) => { const item = record(value, "invalid cell"); const prefix = number(item.prefix, "prefix"); if (!Number.isInteger(prefix)) throw Error("invalid prefix"); return { depth: maxDepth, prefix, locationMm: center(min as number[], side, maxDepth, prefix), displacementMm: item.displacementMm === undefined ? null : item.displacementMm, spreadCells: item.spreadCells === undefined ? null : item.spreadCells, sourceMarginalRatio: number(item.sourceMarginalRatio, "ratio"), mass: number(item.mass, "mass") } as JsonObject; });
++    return { ok: true, output: { frame: { minMm: min, sideMm: side, maxDepth }, cells: page, nextCursor: cursor + page.length < cells.length ? cursor + page.length : null } as JsonObject };
++  } catch (error) { return { ok: false, error: error instanceof Error ? error.message : "invalid query" }; } } };
++  return { descriptor, executor };
++}
++  return { descriptor, executor };
++}
+diff --git a/src/agents_mesh2code/mapping-agent.ts b/src/agents_mesh2code/mapping-agent.ts
+new file mode 100644
+--- /dev/null
++++ b/src/agents_mesh2code/mapping-agent.ts
+@@ -0,0 +1,16 @@
++import type { CanonicalPart } from "@harness/template/llm/protocol";
++import type { ModelRef, JsonObject } from "@harness/template/types";
++import type { RouteDef } from "@harness/template";
++import { generateOnce } from "../llm/generate.ts";
++import { makeMappingFactsTool, type MappingFactsSource } from "../tools_mesh2code/mapping-facts.ts";
++import { parseMappingFeedbackArtifact, type MappingFeedbackArtifact } from "./mapping-feedback-schema.ts";
++export interface MappingAgentResult { artifact: MappingFeedbackArtifact }
++const SYSTEM = "You are a standalone mapping evaluator. Use only supplied mapping facts. Return one schemaVersion 1 feedback artifact with status, issues, and evidence. State candidate to GT world direction. Never expose paths, raw mesh, handles, bytes, materials, textures, targets, or pass/fail authority.";
++export async function runMappingAgent(args: { source: MappingFactsSource; route: RouteDef<unknown>; model: ModelRef; signal?: AbortSignal }): Promise<MappingAgentResult> {
++  const executor = makeMappingFactsTool(args.source).executor; const cells: JsonObject[] = []; let cursor = 0; let frame: JsonObject | undefined;
++  do { const result = await executor.execute({ cursor, limit: 256 } as JsonObject, {} as never); if (!result.ok) throw Error(result.error); const page = result.output as JsonObject; frame = page.frame as JsonObject; cells.push(...(page.cells as JsonObject[])); cursor = page.nextCursor === null ? -1 : Number(page.nextCursor); } while (cursor >= 0);
++  const request: CanonicalPart[] = [{ kind: "text", text: JSON.stringify({ frame, cells }) }];
++  const response = await generateOnce({ route: args.route, model: args.model, system: SYSTEM, parts: request, signal: args.signal });
++  const text = response.text.trim().replace(/^```(?:json)?\\s*/, "").replace(/\\s*```$/, "");
++  return { artifact: parseMappingFeedbackArtifact(text) };
++}
+diff --git a/src/tools_mesh2code/render_mapping_report.py b/src/tools_mesh2code/render_mapping_report.py
+new file mode 100644
+--- /dev/null
++++ b/src/tools_mesh2code/render_mapping_report.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++"""Render bounded /3 mapping evidence as front, top and side PNGs."""
++import argparse, json
++from pathlib import Path
++import matplotlib; matplotlib.use("Agg")
++import matplotlib.pyplot as plt
++import numpy as np
++from mpl_toolkits.mplot3d.art3d import Poly3DCollection
++def load_obj(path):
++    vertices, faces = [], []
++    for line in path.open(encoding="utf-8"):
++        fields = line.split()
++        if fields and fields[0] == "v": vertices.append([float(x) for x in fields[1:4]])
++        elif fields and fields[0] == "f": faces.append([int(x.split("/")[0])-1 for x in fields[1:]])
++    return np.asarray(vertices, dtype=float), faces
++def decode(prefix, depth):
++    xyz = [0, 0, 0]
++    for shift in range(depth - 1, -1, -1):
++        child = (prefix >> (3 * shift)) & 7
++        xyz = [(xyz[i] << 1) | ((child >> (2 - i)) & 1) for i in range(3)]
++    return np.asarray(xyz, dtype=float)
++def render(report_path, gt_path, candidate_path, out_dir, max_arrows=220):
++    report = json.loads(report_path.read_text(encoding="utf-8")); level = max(report["levels"], key=lambda x: x["summary"]["depth"])
++    depth = int(level["summary"]["depth"]); frame = report["frame"]; minimum = np.asarray(frame["minMm"], dtype=float); scale = float(frame["sideMm"]) / (1 << depth)
++    cells = [c for c in level["candidateCells"] if c["displacementMm"] is not None]; cells.sort(key=lambda c: c["prefix"])
++    if len(cells) > max_arrows: cells = [cells[i] for i in np.linspace(0, len(cells)-1, max_arrows, dtype=int)]
++    meshes = [(load_obj(gt_path), "#2f73b8", .20), (load_obj(candidate_path), "#777777", .16)]; out_dir.mkdir(parents=True, exist_ok=True); outputs = []
++    for name, elev, azim in (("front",10,-90),("top",90,-90),("side",0,0)):
++        fig = plt.figure(figsize=(10,10), dpi=160); ax = fig.add_subplot(111, projection="3d")
++        for (vertices, faces), colour, alpha in meshes: ax.add_collection3d(Poly3DCollection([[vertices[i] for i in face] for face in faces], facecolor=colour, edgecolor="none", alpha=alpha))
++        for cell in cells:
++            source = minimum + (decode(int(cell["prefix"]), depth) + .5) * scale; vector = np.asarray(cell["displacementMm"], dtype=float)
++            ax.quiver(*source, *vector, color=plt.cm.plasma(float(np.clip(cell["sourceMarginalRatio"],0,1))), linewidth=.7, arrow_length_ratio=.12, alpha=.8)
++        ax.set(xlim=(-1,1), ylim=(-1,1), zlim=(-1,1), xlabel="X", ylabel="Y", zlabel="Z"); ax.set_box_aspect((1,1,1))
++        ax.set_title("All mapped cells\nGT blue · candidate gray · arrows = candidate → GT (/3 displacement target proxy)"); ax.view_init(elev=elev, azim=azim)
++        scalar = plt.cm.ScalarMappable(cmap="plasma", norm=plt.Normalize(0,1)); scalar.set_array([]); fig.colorbar(scalar, ax=ax, shrink=.55, label="source marginal ratio")
++        output = out_dir / ("mapping-report-" + name + ".png"); fig.tight_layout(); fig.savefig(output); plt.close(fig); outputs.append(output)
++    return outputs
++def main():
++    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--report", type=Path, required=True); parser.add_argument("--gt", type=Path, required=True); parser.add_argument("--candidate", type=Path, required=True); parser.add_argument("--out-dir", type=Path, required=True); parser.add_argument("--max-arrows", type=int, default=220)
++    args = parser.parse_args()
++    if args.max_arrows < 1: parser.error("--max-arrows must be positive")
++    for path in render(args.report, args.gt, args.candidate, args.out_dir, args.max_arrows): print(path)
++if __name__ == "__main__": main()
