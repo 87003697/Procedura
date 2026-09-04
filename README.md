@@ -95,6 +95,22 @@ PROCEDURA_MODEL=gemini:gemini-3-pro-preview  # force the native Gemini transport
 the resolution order. `.env.example` documents every other knob — reasoning
 effort, binary paths, timeouts, retry budgets.
 
+#### Per-user configuration
+
+Put shared local configuration in `$HOME/.secrets/procedura.env` and run
+`bash scripts/install-deps.sh`. Every normal setup run validates that file and
+rebuilds the current worktree `.env` from `.env.example` plus the declared
+values. This intentionally overwrites the worktree `.env`; keep any persistent
+local configuration in the user file and treat `.env` as a generated snapshot.
+If the user file is missing, setup rebuilds `.env` from the template alone.
+
+Use the small shell-compatible form `export NAME=value` (blank lines and `#`
+comments are ignored); quoted values are supported. Keep the user file private
+(`chmod 600 "$HOME/.secrets/procedura.env"`). Process environment values are
+never written to the snapshot. Setup never executes the file, expands variables,
+prints values, or copies it into Git; malformed lines stop setup with a line
+number and no secret value in the error.
+
 **Reference images are an input, not an assumption.** Procedura will not call an
 image API on your behalf: with no `--image` and no image model configured, a run
 goes text-only rather than quietly spending on an endpoint you never named.
