@@ -1,0 +1,274 @@
+diff --git a/.agents/plans/2026-09-04-user-env-loader.md b/.agents/plans/2026-09-04-user-env-loader.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..c005645834ee199de672f5b8c461d2b9c1b21be3
+--- /dev/null
++++ b/.agents/plans/2026-09-04-user-env-loader.md
+@@ -0,0 +1,50 @@
++# Plan: Setup-only User Environment Seeding
++
++## 目标与完成标准
++
++让新 worktree 通过现有 `scripts/install-deps.sh` 复用用户级本地配置，而不在任何 CLI 或 pipeline 中增加运行时接缝。安装脚本每次正常运行都读取可选 `$HOME/.secrets/procedura.env`，验证必要的 `export NAME=value` 子集，并重建当前 worktree 的私有 `.env`；已有 `.env` 会被有意覆盖，用户文件不存在时重建为模板。
++
++完成标准：无 `src/config/user-env.ts`、无六个 CLI import diff；setup-only 同步逻辑可在临时 HOME/worktree 中验证首次生成、重复运行覆盖、process env 优先、缺失用户文件和非法行；不复制真实 secret 到 Git，不执行 shell 或变量展开。
++
++## 方案与边界
++
++- 仅修改 `scripts/install-deps.sh`、`.env.example`、`README.md` 和本计划/patch 资产。
++- `install-deps.sh` 每次正常运行先完整验证用户文件到权限受限临时文件，再从 `.env.example` 重建 `.env` 并追加声明；process environment 已有的变量不写入，已有 `.env` 不保留。
++- 支持空行、注释、`export NAME=value`、单/双引号值；拒绝非法变量名、残余字符、未加引号的空白或 `#`；错误仅含文件和行号，不输出值。
++- 现有 Bun dotenv 行为不变：后续 CLI 继续只读取当前 worktree `.env` 和 process environment。`.env` 是每次 setup 生成的本地快照；用户文件修改后重新运行 setup 即可同步。
++
++## 非目标
++
++- 不修改任何 CLI、pipeline、web、Plan1–5 业务逻辑或模型/二进制发现代码。
++- 不引入 dotenv、运行时 loader、变量展开、shell 执行、加密存储或新的配置优先级。
++- 不创建、修改或运行 unit tests；不 commit、push 或创建 Issue。
++
++## Patch Artifact
++
++- 计划基线：`main` HEAD `4e98b2737ac3dc8889f78138821a2f53c5c8a124`
++- Planned Patch：[2026-09-04-user-env-loader.planned.patch](</Users/zhiyuanma/Desktop/Codes/Procedura/.agents/plans/2026-09-04-user-env-loader.planned.patch>)
++- Final Patch：[2026-09-04-user-env-loader.final.patch](</Users/zhiyuanma/Desktop/Codes/Procedura/.agents/plans/2026-09-04-user-env-loader.final.patch>)
++
++## Patch Intent
++
++- `scripts/install-deps.sh`：新增 setup-only 用户文件验证/同步，每次正常运行重建并覆盖当前 `.env`。
++- `.env.example`、`README.md`：仅保留变量名、用途、必要示例，说明用户文件格式、`chmod 600`、每次覆盖同步时机和每个 worktree 的本地副本取舍；模板不承载平台探测或默认逻辑。
++- 删除上一版的 `src/config/user-env.ts` 与六个 CLI import，确保无 CLI 侵入。
++
++## 验证
++
++- `bash -n scripts/install-deps.sh`
++- `bun run typecheck`
++- `bun run procedura --help`、`bun run mesh-to-cad --help`、`bun run motion --help`、`bun run batch --help`
++- 临时 HOME/worktree：首次生成、再次运行覆盖更新、旧 `.env` 被替换、process env 优先、用户文件缺失重建模板、非法/残余引号行拒绝且不泄露值。
++- stale search 确认无 `user-env.ts`、无 CLI loader import；干净基线 `git apply --check` 和 diff-check。
++
++## 状态
++
++当前阶段：Implemented
++
++## Implementation Review
++
++- Mode A：No findings；精简版 `.env.example` 与每次覆盖同步的 Planned Patch 可从基线应用，且无 CLI/pipeline/web diff。
++- Mode B：No findings；Planned 与 Final 的 P→F 无实现差异，Final 仅含 setup 脚本、精简配置模板、README 和计划资产。
++- 未运行 unit tests；未修改 upstream 业务文件。
+diff --git a/.env.example b/.env.example
+index 96c529bbbf8043b1a916e256741d0b4f0fd26f65..1808f267e5c9a7b1a4e310880a9fa91babd97e2c 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,68 +1,32 @@
+-# Procedura configuration. Copy to `.env` and fill in — Bun loads it
+-# automatically, or point at it explicitly with `bun --env-file=.env ...`.
+-#
+-# Procedura ships no hosted backend and no keys. It talks to whatever endpoint
+-# you configure below, so the same code runs against the OpenAI API, the Google
+-# GenAI API, OpenRouter, a corporate gateway, or a local server.
++# Procedura local configuration template.
++# Setup rebuilds .env from this file and $HOME/.secrets/procedura.env.
++# Never put real secrets in this tracked template.
+ 
+-# ─── LLM: OpenAI-compatible endpoint (the default provider) ──────────────────
+-# Any server exposing POST {OPENAI_BASE_URL}/chat/completions with SSE. Point it
+-# at api.openai.com, OpenRouter, a gateway, or a local vLLM / Ollama / LM Studio.
++# OpenAI-compatible LLM endpoint and key.
+ OPENAI_API_KEY=
+ OPENAI_BASE_URL=https://api.openai.com/v1
+ 
+-# ─── LLM: Google Gemini, native GenAI path (optional) ────────────────────────
+-# Only needed for model keys that resolve to the `gemini` provider. Leave
+-# GEMINI_API_KEY empty if your gateway injects its own upstream credentials.
++# Optional native Gemini endpoint and key.
+ # GEMINI_API_KEY=
+ # GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta
+ 
+-# ─── Model selection ─────────────────────────────────────────────────────────
+-# The model every stage uses unless a CLI flag overrides it. Any id your
+-# endpoint serves works; prefix with `openai:` or `gemini:` to force a transport
+-# (e.g. gemini:gemini-3-pro-preview). See src/config/models.ts.
++# Default model/provider selection.
+ # PROCEDURA_MODEL=gpt-5.2
+-
+-# ─── Reference-image generation (OFF by default) ─────────────────────────────
+-# Procedura reconstructs a reference image. With this UNSET it will not call an
+-# image API on your behalf: supply the reference with `--image <path>`, or opt
+-# out of references entirely with `--no-image`. Set it to enable generation —
+-# the endpoint and key come from OPENAI_BASE_URL / OPENAI_API_KEY above.
+-# PROCEDURA_IMAGE_MODEL=gpt-image-1
+-
+-# Provider used for a model key that has no prefix and no catalog entry.
+-# `openai` (default) or `gemini`.
+ # PROCEDURA_PROVIDER=openai
+-
+-# Sent as the `reasoning_effort` body param on OpenAI-compatible calls. Unset by
+-# default, because endpoints serving non-OpenAI models reject the parameter.
+-# Typical values: low | medium | high.
+ # PROCEDURA_REASONING_EFFORT=high
+ 
+-# Full-URL override, if your gateway puts image generation somewhere other
+-# than {OPENAI_BASE_URL}/images/generations.
++# Optional reference-image generation.
++# PROCEDURA_IMAGE_MODEL=gpt-image-1
+ # PROCEDURA_IMAGE_API_URL=
+ 
+-# ─── External binaries ───────────────────────────────────────────────────────
+-# OpenSCAD must be a MANIFOLD-capable build (2023.03+ or a recent snapshot).
+-# A pre-Manifold binary falls back to CGAL and is orders of magnitude slower —
+-# a single hull() measured 1774s against 1.77s. Left unset, Procedura searches
+-# $PATH and a few conventional install locations, and refuses to run on a
+-# non-Manifold build unless PROCEDURA_ALLOW_CGAL_OPENSCAD=1.
+-# OPENSCAD_PATH=/usr/local/bin/openscad
+-
+-# Blender, for the AO / parts-colour / PBR renders the critic looks at.
+-# PROCEDURA_BLENDER_PATH=/usr/local/bin/blender
+-
+-# Private source meshes for Mesh-to-CAD. The CLI and Studio must share this
+-# directory; run outputs contain only opaque reference handles.
+-# PROCEDURA_REFERENCE_ROOT=/absolute/path/outside-procedura-outputs/references
+-
+-# NVIDIA Isaac Sim, only for `--motion` physics validation. Defaults to ~/isaacsim.
+-# PROCEDURA_ISAACSIM_PATH=
++# External tools and private mesh storage.
++# OPENSCAD_PATH=/path/to/openscad
++# PROCEDURA_BLENDER_PATH=/path/to/blender
++# PROCEDURA_REFERENCE_ROOT=/absolute/path/to/references
++# PROCEDURA_ISAACSIM_PATH=/absolute/path/to/isaacsim
+ 
+-# ─── LLM resilience (defaults are usually fine) ──────────────────────────────
+-# PROCEDURA_LLM_TIMEOUT_MS=600000       # per-attempt timeout
+-# PROCEDURA_LLM_DEADLINE_MS=600000      # wall-clock cap across retries
++# Optional LLM timing and retry limits (milliseconds/counts).
++# PROCEDURA_LLM_TIMEOUT_MS=600000
++# PROCEDURA_LLM_DEADLINE_MS=600000
+ # PROCEDURA_LLM_MAX_ATTEMPTS=5
+-# PROCEDURA_LLM_STREAM_IDLE_MS=300000   # kill a stream that stops emitting
++# PROCEDURA_LLM_STREAM_IDLE_MS=300000
+diff --git a/README.md b/README.md
+index d942ad1e3e67622ef110ea0b685689fa68589bc0..c20ca27429ed83193d768ca0dde0d8f2ff60ee77 100644
+--- a/README.md
++++ b/README.md
+@@ -95,6 +95,22 @@ PROCEDURA_MODEL=gemini:gemini-3-pro-preview  # force the native Gemini transport
+ the resolution order. `.env.example` documents every other knob — reasoning
+ effort, binary paths, timeouts, retry budgets.
+ 
++#### Per-user configuration
++
++Put shared local configuration in `$HOME/.secrets/procedura.env` and run
++`bash scripts/install-deps.sh`. Every normal setup run validates that file and
++rebuilds the current worktree `.env` from `.env.example` plus the declared
++values. This intentionally overwrites the worktree `.env`; keep any persistent
++local configuration in the user file and treat `.env` as a generated snapshot.
++If the user file is missing, setup rebuilds `.env` from the template alone.
++
++Use the small shell-compatible form `export NAME=value` (blank lines and `#`
++comments are ignored); quoted values are supported. Keep the user file private
++(`chmod 600 "$HOME/.secrets/procedura.env"`). Process environment values are
++never written to the snapshot. Setup never executes the file, expands variables,
++prints values, or copies it into Git; malformed lines stop setup with a line
++number and no secret value in the error.
++
+ **Reference images are an input, not an assumption.** Procedura will not call an
+ image API on your behalf: with no `--image` and no image model configured, a run
+ goes text-only rather than quietly spending on an endpoint you never named.
+diff --git a/scripts/install-deps.sh b/scripts/install-deps.sh
+index 72725f1a656adcb1e2f8fbec013689dd76f1ee51..a7b05b0f6793d4f8d67c9ab069ef879916cf14a9 100755
+--- a/scripts/install-deps.sh
++++ b/scripts/install-deps.sh
+@@ -43,6 +43,16 @@ info() { printf "  ${DIM}%s${N}\n" "$*"; }
+ 
+ MISSING=()
+ 
++# Remember which binary paths came from the caller before the current worktree
++# .env is consulted below. Those caller values must remain process-only and
++# must not be mistaken for values imported from the old .env during a sync.
++OPENSCAD_PROCESS_ENV_SET=0
++PROCEDURA_BLENDER_PROCESS_ENV_SET=0
++PROCEDURA_ISAACSIM_PROCESS_ENV_SET=0
++printenv OPENSCAD_PATH >/dev/null 2>&1 && OPENSCAD_PROCESS_ENV_SET=1
++printenv PROCEDURA_BLENDER_PATH >/dev/null 2>&1 && PROCEDURA_BLENDER_PROCESS_ENV_SET=1
++printenv PROCEDURA_ISAACSIM_PATH >/dev/null 2>&1 && PROCEDURA_ISAACSIM_PROCESS_ENV_SET=1
++
+ # The repo's .env already records where the binaries live; honour it, so a
+ # configured machine reports "found" instead of re-downloading 350 MB.
+ if [ -f "$REPO/.env" ]; then
+@@ -197,13 +207,75 @@ fi
+ 
+ # ── 5. Configuration ────────────────────────────────────────────────────────
+ step "5/5  Configuration"
++# User-level secrets at $HOME/.secrets/procedura.env are validated and copied
++# into the current worktree .env on every setup run.
++sync_user_env() {
++  local user_file="${HOME:-}/.secrets/procedura.env"
++  local assignments="$REPO/.env.user.$$"
++  local line_number=0 line text key value process_value
++  local single_re="^'[^']*'$"
++  local double_re='^"([^"\\]|\\["\\])*"$'
++
++  if [ ! -f "$user_file" ]; then
++    cp "$REPO/.env.example" "$REPO/.env"
++    ok "created .env from .env.example"
++    return
++  fi
++
++  umask 077
++  : > "$assignments"
++  while IFS= read -r line || [ -n "$line" ]; do
++    line_number=$((line_number + 1))
++    text="${line#${line%%[![:space:]]*}}"
++    text="${text%${text##*[![:space:]]}}"
++    [ -z "$text" ] && continue
++    [[ "$text" == \#* ]] && continue
++    if [[ ! "$text" =~ ^export[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
++      rm -f "$assignments"
++      bad "invalid user env file at line $line_number: expected export NAME=value"
++      exit 2
++    fi
++    key="${BASH_REMATCH[1]}"
++    value="${BASH_REMATCH[2]}"
++    value="${value#${value%%[![:space:]]*}}"
++    value="${value%${value##*[![:space:]]}}"
++    if [[ "$value" == \'* ]]; then
++      [[ "$value" =~ $single_re ]] || { rm -f "$assignments"; bad "invalid user env file at line $line_number: invalid quoted value"; exit 2; }
++    elif [[ "$value" == \"* ]]; then
++      [[ "$value" =~ $double_re ]] || { rm -f "$assignments"; bad "invalid user env file at line $line_number: invalid quoted value"; exit 2; }
++    elif [[ "$value" == *[[:space:]#]* ]]; then
++      rm -f "$assignments"
++      bad "invalid user env file at line $line_number: unquoted value must not contain whitespace or #"
++      exit 2
++    fi
++    process_value=0
++    case "$key" in
++      OPENSCAD_PATH) process_value="$OPENSCAD_PROCESS_ENV_SET" ;;
++      PROCEDURA_BLENDER_PATH) process_value="$PROCEDURA_BLENDER_PROCESS_ENV_SET" ;;
++      PROCEDURA_ISAACSIM_PATH) process_value="$PROCEDURA_ISAACSIM_PROCESS_ENV_SET" ;;
++      *) printenv "$key" >/dev/null 2>&1 && process_value=1 ;;
++    esac
++    if [ "$process_value" = 0 ]; then
++      printf '%s=%s\n' "$key" "$value" >> "$assignments"
++    fi
++  done < "$user_file"
++
++  cp "$REPO/.env.example" "$REPO/.env"
++  cat "$assignments" >> "$REPO/.env"
++  rm -f "$assignments"
++  ok "created .env from .env.example and $user_file"
++}
++
+ if [ -f "$REPO/.env" ]; then
+-  ok ".env exists (left untouched)"
++  if [ "$CHECK_ONLY" = 1 ]; then
++    ok ".env exists (would be rebuilt on a normal setup run)"
++  else
++    sync_user_env
++  fi
+ elif [ "$CHECK_ONLY" = 1 ]; then
+-  warn ".env missing — copy .env.example and add your endpoint"
++  warn ".env missing — setup would seed it from the user config or .env.example"
+ else
+-  cp "$REPO/.env.example" "$REPO/.env"
+-  ok "created .env from .env.example"
++  sync_user_env
+ fi
+ if grep -qE '^\s*(OPENAI_API_KEY|GEMINI_API_KEY)=\S' "$REPO/.env" 2>/dev/null; then
+   ok "an LLM key is set"

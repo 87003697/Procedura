@@ -43,6 +43,16 @@ info() { printf "  ${DIM}%s${N}\n" "$*"; }
 
 MISSING=()
 
+# Remember which binary paths came from the caller before the current worktree
+# .env is consulted below. Those caller values must remain process-only and
+# must not be mistaken for values imported from the old .env during a sync.
+OPENSCAD_PROCESS_ENV_SET=0
+PROCEDURA_BLENDER_PROCESS_ENV_SET=0
+PROCEDURA_ISAACSIM_PROCESS_ENV_SET=0
+printenv OPENSCAD_PATH >/dev/null 2>&1 && OPENSCAD_PROCESS_ENV_SET=1
+printenv PROCEDURA_BLENDER_PATH >/dev/null 2>&1 && PROCEDURA_BLENDER_PROCESS_ENV_SET=1
+printenv PROCEDURA_ISAACSIM_PATH >/dev/null 2>&1 && PROCEDURA_ISAACSIM_PROCESS_ENV_SET=1
+
 # The repo's .env already records where the binaries live; honour it, so a
 # configured machine reports "found" instead of re-downloading 350 MB.
 if [ -f "$REPO/.env" ]; then
@@ -197,13 +207,75 @@ fi
 
 # ── 5. Configuration ────────────────────────────────────────────────────────
 step "5/5  Configuration"
-if [ -f "$REPO/.env" ]; then
-  ok ".env exists (left untouched)"
-elif [ "$CHECK_ONLY" = 1 ]; then
-  warn ".env missing — copy .env.example and add your endpoint"
-else
+# User-level secrets at $HOME/.secrets/procedura.env are validated and copied
+# into the current worktree .env on every setup run.
+sync_user_env() {
+  local user_file="${HOME:-}/.secrets/procedura.env"
+  local assignments="$REPO/.env.user.$$"
+  local line_number=0 line text key value process_value
+  local single_re="^'[^']*'$"
+  local double_re='^"([^"\\]|\\["\\])*"$'
+
+  if [ ! -f "$user_file" ]; then
+    cp "$REPO/.env.example" "$REPO/.env"
+    ok "created .env from .env.example"
+    return
+  fi
+
+  umask 077
+  : > "$assignments"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line_number=$((line_number + 1))
+    text="${line#${line%%[![:space:]]*}}"
+    text="${text%${text##*[![:space:]]}}"
+    [ -z "$text" ] && continue
+    [[ "$text" == \#* ]] && continue
+    if [[ ! "$text" =~ ^export[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      rm -f "$assignments"
+      bad "invalid user env file at line $line_number: expected export NAME=value"
+      exit 2
+    fi
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    value="${value#${value%%[![:space:]]*}}"
+    value="${value%${value##*[![:space:]]}}"
+    if [[ "$value" == \'* ]]; then
+      [[ "$value" =~ $single_re ]] || { rm -f "$assignments"; bad "invalid user env file at line $line_number: invalid quoted value"; exit 2; }
+    elif [[ "$value" == \"* ]]; then
+      [[ "$value" =~ $double_re ]] || { rm -f "$assignments"; bad "invalid user env file at line $line_number: invalid quoted value"; exit 2; }
+    elif [[ "$value" == *[[:space:]#]* ]]; then
+      rm -f "$assignments"
+      bad "invalid user env file at line $line_number: unquoted value must not contain whitespace or #"
+      exit 2
+    fi
+    process_value=0
+    case "$key" in
+      OPENSCAD_PATH) process_value="$OPENSCAD_PROCESS_ENV_SET" ;;
+      PROCEDURA_BLENDER_PATH) process_value="$PROCEDURA_BLENDER_PROCESS_ENV_SET" ;;
+      PROCEDURA_ISAACSIM_PATH) process_value="$PROCEDURA_ISAACSIM_PROCESS_ENV_SET" ;;
+      *) printenv "$key" >/dev/null 2>&1 && process_value=1 ;;
+    esac
+    if [ "$process_value" = 0 ]; then
+      printf '%s=%s\n' "$key" "$value" >> "$assignments"
+    fi
+  done < "$user_file"
+
   cp "$REPO/.env.example" "$REPO/.env"
-  ok "created .env from .env.example"
+  cat "$assignments" >> "$REPO/.env"
+  rm -f "$assignments"
+  ok "created .env from .env.example and $user_file"
+}
+
+if [ -f "$REPO/.env" ]; then
+  if [ "$CHECK_ONLY" = 1 ]; then
+    ok ".env exists (would be rebuilt on a normal setup run)"
+  else
+    sync_user_env
+  fi
+elif [ "$CHECK_ONLY" = 1 ]; then
+  warn ".env missing — setup would seed it from the user config or .env.example"
+else
+  sync_user_env
 fi
 if grep -qE '^\s*(OPENAI_API_KEY|GEMINI_API_KEY)=\S' "$REPO/.env" 2>/dev/null; then
   ok "an LLM key is set"
