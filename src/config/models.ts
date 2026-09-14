@@ -88,7 +88,7 @@ function fallbackProviderId(): ProviderId {
 }
 
 /** The model every stage uses unless a CLI flag overrides it. */
-export const DEFAULT_MODEL = process.env["PROCEDURA_MODEL"] ?? "gpt-5.2";
+export const DEFAULT_MODEL = process.env["PROCEDURA_MODEL"] ?? "gpt-5.5";
 
 /** Split an explicit `provider:model` key; undefined if there is no prefix. */
 function splitProviderPrefix(key: string): ModelRef | undefined {

@@ -397,7 +397,7 @@ export interface IncrementalDraftOpts {
   /** Ordered provided views. The first is authoritative and copied to image.png;
    * later views are supplementary. One entry is the single-view form. */
   inputImages?: readonly { label: string; path: string }[];
-  /** Host-produced plan.json; skips planner and reviewer when supplied. */
+  /** Host-produced plan.json; the normal plan-review pass still runs on fresh builds. */
   inputPlan?: string;
   /**
    * Text-only mode: generate from the prompt with NO reference image at all.
@@ -452,6 +452,8 @@ export interface IncrementalDraftOpts {
    * prompts and the seed are byte-identical to the baseline pipeline.
    * Env kill switch: PROCEDURA_INCREMENTAL_ASSEMBLY=0. */
   assemblyAware?: boolean;
+  /** Enable the per-part assembly gate when assemblyAware is on. */
+  assemblyGate?: boolean;
   log?: (line: string) => void;
   trajectorySink?: (event: import("@harness/template/trajectory").TrajectoryEvent) => void | Promise<void>;
   trajectoryPathOverride?: string;
@@ -2179,7 +2181,7 @@ export async function runIncrementalDraft(
   const feedbackRenderSize = Number(process.env["PROCEDURA_FEEDBACK_RENDER_SIZE"] ?? "1024");
   const inputPlan = opts.inputPlan;
   const suppliedPlan = inputPlan !== undefined;
-  const CONTEXT_VIEWS = suppliedPlan ? [] : resolveContextViews(opts.contextRenders ?? false);
+  const CONTEXT_VIEWS = resolveContextViews(opts.contextRenders ?? false);
   // Assembly-aware incremental mode (Slice 1: mating-feature library + prompt).
   // Same opt-in-plus-kill-switch shape as motionAware; independent of it.
   const assemblyAware = (opts.assemblyAware ?? false) &&
@@ -2251,7 +2253,7 @@ export async function runIncrementalDraft(
   const planJsonPath = join(outDir, "plan.json");
   // Resume a killed draft: reuse the plan + the parts already committed to
   // draft.scad, and continue from the first uncommitted part.
-  const resuming = !suppliedPlan && Boolean(opts.resume) && existsSync(planJsonPath) && existsSync(scadPath);
+  const resuming = Boolean(opts.resume) && existsSync(planJsonPath) && existsSync(scadPath);
   // Assembly-aware: inline the mating-feature helper library into the seed so
   // both mating parts call identical helpers (fit by construction) and every
   // derived compile stays self-contained. On RESUME the committed draft.scad
@@ -2390,7 +2392,7 @@ export async function runIncrementalDraft(
     if (inputPlan !== undefined && !resuming) {
       const sourcePlan = resolve(inputPlan);
       if (!existsSync(sourcePlan)) throw new Error("inputPlan not found: " + sourcePlan);
-      plan.push(...parsePlanJson(readFileSync(sourcePlan, "utf8"), 0));
+      plan.push(...parsePlanJson(readFileSync(sourcePlan, "utf8"), 0, { assembly: assemblyAware }));
       writeFileSync(planJsonPath, JSON.stringify(plan, null, 2), "utf8");
       emit("draft.plan.ready", { partCount: plan.length, source: "provided" });
     } else if (!noPlan) {
@@ -2473,7 +2475,7 @@ export async function runIncrementalDraft(
     // stops reviewing and proceeds with the best plan so far (never kills the
     // run). Set PROCEDURA_PLAN_REVIEW_ITERS=0 to disable.
     const planReviewIters = opts.planReviewIters ?? DEFAULT_PLAN_REVIEW_ITERS;
-    if (!noPlan && !suppliedPlan && !resuming && planReviewIters > 0) {
+    if (!noPlan && !resuming && planReviewIters > 0) {
       const planReviewSystem = readFileSync(PLAN_REVIEW_SYSTEM_PATH, "utf8") +
         planMotionAddendum + planAssemblyAddendum +
         (motionAware ? "\n\n" + PLAN_REVIEW_MOTION_NOTE : "") +
@@ -2553,7 +2555,7 @@ export async function runIncrementalDraft(
     let floatersBefore = 0;
     // Gate is on by default; set PROCEDURA_INCREMENTAL_CONN_GATE=0 to reproduce the
     // pre-gate baseline (commit every part unconditionally, no connectivity check).
-    const connGateEnabled = !suppliedPlan && (process.env["PROCEDURA_INCREMENTAL_CONN_GATE"] ?? "1") !== "0";
+    const connGateEnabled = (process.env["PROCEDURA_INCREMENTAL_CONN_GATE"] ?? "1") !== "0";
     log(`[inc-draft] per-part connectivity gate: ${connGateEnabled ? "ON" : "OFF"}`);
     log(`[inc-draft] 3D feedback per part: ${CONTEXT_VIEWS.length ? CONTEXT_VIEWS.join(", ") : "OFF"}`);
     // Opt-in motion gate (pre-commit parent-attachment / non-parent-fusion
@@ -2566,19 +2568,19 @@ export async function runIncrementalDraft(
     }
     // Opt-in pre-commit assembly gate (contact + interpenetration on parts with a
     // declared partner); default OFF — set PROCEDURA_INCREMENTAL_ASSEMBLY_GATE=1.
-    const assemblyGateEnabled = !suppliedPlan &&
-      assemblyAware && process.env["PROCEDURA_INCREMENTAL_ASSEMBLY_GATE"] === "1";
+    const assemblyGateEnabled = assemblyAware &&
+      (opts.assemblyGate ?? process.env["PROCEDURA_INCREMENTAL_ASSEMBLY_GATE"] === "1");
     // ── Profiling escape hatches. Both DEGRADE the build; they exist to
     // measure the floor cost of gen + split + render, not to ship with. ──
     // Skips every mate measurement, including the floater-override path that
     // rescues a correctly-seated clearance fit — so more parts read as floaters.
-    const skipMateCheck = !suppliedPlan && process.env["PROCEDURA_SKIP_MATE_CHECK"] === "1";
+    const skipMateCheck = process.env["PROCEDURA_SKIP_MATE_CHECK"] === "1";
     // Skips the per-part whole-assembly compile. That compile is ALSO how a
     // broken part is detected: without it there is no compile error to retry
     // on, no connectivity gate, and no build-so-far mesh, so parts commit
     // unvalidated and the draft can end up structurally wrong.
-    const skipPartCompile = !suppliedPlan && process.env["PROCEDURA_SKIP_PART_COMPILE"] === "1";
-    const maxGenAttempts = suppliedPlan ? 1 : GEN_MAX_ATTEMPTS;
+    const skipPartCompile = process.env["PROCEDURA_SKIP_PART_COMPILE"] === "1";
+    const maxGenAttempts = GEN_MAX_ATTEMPTS;
     if (skipMateCheck || skipPartCompile) {
       log(`  WARNING: profiling flags active — ` +
           `${skipPartCompile ? "per-part compile+gate OFF " : ""}` +

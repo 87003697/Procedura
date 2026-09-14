@@ -106,6 +106,9 @@ export interface RunProceduraOpts {
    * (shared-nominal pegs/sockets, bolt patterns, snaps). Opt-in; independent of
    * motion. Env kill switch: PROCEDURA_INCREMENTAL_ASSEMBLY=0. Incremental only. */
   assembly?: boolean;
+  /** Enable the per-part assembly gate when assembly-aware generation is on.
+   * Defaults to PROCEDURA_INCREMENTAL_ASSEMBLY_GATE for ordinary callers. */
+  assemblyGate?: boolean;
   /** Multi-ref (incremental only): generate this many EXTRA reference views from
    * the text and attach all (primary + extras) to the plan / per-part gen calls.
    * 0 (default) = single reference. */
@@ -315,6 +318,7 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
           motionAware: opts.motionAware
             ?? Boolean(opts.incremental && opts.motion && opts.incrementalMotion !== false),
           assemblyAware: Boolean(opts.incremental && opts.assembly),
+          ...(opts.assemblyGate !== undefined ? { assemblyGate: opts.assemblyGate } : {}),
           ...(opts.noPlan ? { noPlan: true } : {}),
           trajectorySink: writer.sink,
           trajectoryPathOverride: writer.path,

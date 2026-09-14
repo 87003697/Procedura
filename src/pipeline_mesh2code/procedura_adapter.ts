@@ -23,13 +23,16 @@ export function runMeshToCadProcedura(
     text: "Generate editable CAD from this host-produced plan:\n\n" + opts.planText,
     outputDir: opts.outputDir,
     incremental: true,
+    contextRenders: true,
+    assembly: true,
+    assemblyGate: true,
+    exportStl: true,
     externalExecution: {
       inputImages: opts.referenceImages,
       inputPlan: opts.planPath,
       refineMode: "direct",
       draftPromotion: "open-loop",
     },
-    redo: true,
     refine: opts.refine,
   });
 }
