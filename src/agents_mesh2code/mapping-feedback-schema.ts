@@ -1,35 +1,53 @@
 /** Closed parser for Mapping Agent feedback. */
 export type FeedbackStatus = "ok" | "insufficient-evidence";
-export interface MappingFeedbackEvidence { id: string; kind: "part" | "region" | "overlay"; payload: Record<string, unknown>; }
-export interface MappingFeedbackIssue { partId: string; problem: string; direction: string; magnitudeRangeMm: { min: number; max: number } | null; confidence: number; evidenceIds: string[]; }
-export interface MappingFeedbackArtifact { schemaVersion: 1; status: FeedbackStatus; issues: MappingFeedbackIssue[]; evidence: MappingFeedbackEvidence[]; }
-const forbidden = new Set(["path", "mesh", "vertices", "faces", "source", "raw", "handle", "bytes", "material", "texture", "report", "target"]);
-function object(value: unknown, label: string): Record<string, unknown> { if (!value || typeof value !== "object" || Array.isArray(value)) throw Error(label); return value as Record<string, unknown>; }
-function finite(value: unknown, label: string): number { if (typeof value !== "number" || !Number.isFinite(value)) throw Error(label); return value; }
-function payloadValue(value: unknown): void { if (Array.isArray(value)) { value.forEach(payloadValue); return; } if (value && typeof value === "object") { for (const [key, child] of Object.entries(value)) { if (forbidden.has(key.toLowerCase())) throw Error("forbidden payload field"); payloadValue(child); } return; } if (typeof value === "number") finite(value, "invalid payload number"); }
-function payload(value: unknown): Record<string, unknown> { const item = object(value, "invalid payload"); payloadValue(item); return item; }
+export interface MappingFeedbackRegion { candidatePartIds: string[]; evidenceIds: string[]; diagnosis: string; repairHint: string; }
+export interface MappingFeedbackArtifact { schemaVersion: 5; status: FeedbackStatus; regions: MappingFeedbackRegion[]; }
+const statuses: FeedbackStatus[] = ["ok", "insufficient-evidence"];
+function assert(condition: unknown, message: string): asserts condition { if (!condition) throw Error(message); }
+function object(value: unknown, label: string): Record<string, unknown> {
+  assert(value && typeof value === "object" && !Array.isArray(value), label);
+  return value as Record<string, unknown>;
+}
+function parseJson(text: string): unknown { try { return JSON.parse(text); } catch { throw Error("invalid artifact JSON"); } }
+function keys(value: Record<string, unknown>, allowed: readonly string[], label: string): void {
+  assert(Object.keys(value).every((key) => allowed.includes(key)), label);
+}
+function nonEmptyString(value: unknown, label: string): asserts value is string {
+  assert(typeof value === "string" && value.trim().length > 0, label);
+}
+function evidenceIds(value: unknown): string[] {
+  assert(Array.isArray(value) && value.length > 0, "invalid evidence references");
+  const ids = value.map((id) => {
+    nonEmptyString(id, "invalid evidence reference");
+    return id;
+  });
+  assert(new Set(ids).size === ids.length, "duplicate evidence reference");
+  return ids;
+}
 export function parseMappingFeedbackArtifact(text: string): MappingFeedbackArtifact {
-  let raw: unknown; try { raw = JSON.parse(text); } catch { throw Error("invalid artifact JSON"); }
-  const root = object(raw, "invalid artifact"); const rootFields = ["schemaVersion", "status", "issues", "evidence"];
-  if (Object.keys(root).some((key) => !rootFields.includes(key))) throw Error("unknown artifact field");
-  if (root.schemaVersion !== 1 || (root.status !== "ok" && root.status !== "insufficient-evidence")) throw Error("invalid artifact header");
-  if (!Array.isArray(root.issues) || !Array.isArray(root.evidence)) throw Error("issues and evidence must be arrays");
-  const evidenceIds = new Set<string>();
-  const evidence = root.evidence.map((value) => { const item = object(value, "invalid evidence");
-    if (Object.keys(item).some((key) => !["id", "kind", "payload"].includes(key)) || typeof item.id !== "string" || !item.id || evidenceIds.has(item.id)) throw Error("invalid evidence");
-    if (!["part", "region", "overlay"].includes(String(item.kind))) throw Error("invalid evidence kind");
-    const result = { id: item.id, kind: item.kind as MappingFeedbackEvidence["kind"], payload: payload(item.payload) }; evidenceIds.add(item.id); return result;
+  const root = object(parseJson(text), "invalid artifact");
+  keys(root, ["schemaVersion", "status", "regions"], "unknown artifact field");
+  assert(root.schemaVersion === 5 && statuses.includes(root.status as FeedbackStatus), "invalid artifact header");
+  assert(Array.isArray(root.regions), "regions must be an array");
+  const status = root.status as FeedbackStatus;
+  assert(root.regions.length <= 2, "too many regions");
+  const regions = root.regions.map((value): MappingFeedbackRegion => {
+    const item = object(value, "invalid region");
+    keys(item, ["candidatePartIds", "evidenceIds", "diagnosis", "repairHint"], "invalid region");
+    const candidatePartIds = item.candidatePartIds;
+    assert(Array.isArray(candidatePartIds) && candidatePartIds.length > 0, "invalid region candidates");
+    const partIds = candidatePartIds.map((partId) => {
+      nonEmptyString(partId, "invalid region candidate");
+      return partId;
+    });
+    assert(new Set(partIds).size === partIds.length, "duplicate region candidate");
+    const diagnosis = item.diagnosis;
+    nonEmptyString(diagnosis, "invalid diagnosis");
+    const repairHint = item.repairHint;
+    nonEmptyString(repairHint, "invalid repair hint");
+    const references = evidenceIds(item.evidenceIds);
+    return { candidatePartIds: partIds, evidenceIds: references, diagnosis, repairHint };
   });
-  const issueParts = new Set<string>();
-  const issues = root.issues.map((value): MappingFeedbackIssue => { const item = object(value, "invalid issue");
-    const fields = ["partId", "problem", "direction", "magnitudeRangeMm", "confidence", "evidenceIds"];
-    if (Object.keys(item).some((key) => !fields.includes(key)) || typeof item.partId !== "string" || !item.partId || issueParts.has(item.partId)) throw Error("invalid issue");
-    if (typeof item.problem !== "string" || !item.problem || typeof item.direction !== "string" || !item.direction) throw Error("invalid issue text");
-    const confidence = finite(item.confidence, "confidence"); if (confidence < 0 || confidence > 1) throw Error("confidence out of range");
-    if (!Array.isArray(item.evidenceIds) || item.evidenceIds.length === 0 || item.evidenceIds.some((id) => typeof id !== "string" || !evidenceIds.has(id))) throw Error("invalid evidence reference");
-    let range: { min: number; max: number } | null = null; if (item.magnitudeRangeMm !== null) { const value = object(item.magnitudeRangeMm, "invalid range"); if (Object.keys(value).some((key) => !["min", "max"].includes(key))) throw Error("unknown range field"); const min = finite(value.min, "range.min"); const max = finite(value.max, "range.max"); if (min < 0 || max < min || max > 1000) throw Error("invalid magnitude range"); range = { min, max }; }
-    issueParts.add(item.partId); return { partId: item.partId, problem: item.problem, direction: item.direction, magnitudeRangeMm: range, confidence, evidenceIds: [...item.evidenceIds] };
-  });
-  if ((root.status === "insufficient-evidence") !== (issues.length === 0)) throw Error("status does not match issues");
-  return { schemaVersion: 1, status: root.status, issues, evidence };
+  assert((status === "insufficient-evidence") === (regions.length === 0), "status does not match regions");
+  return { schemaVersion: 5, status, regions };
 }
