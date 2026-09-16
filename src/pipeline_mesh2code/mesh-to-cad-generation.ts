@@ -40,11 +40,14 @@ export async function runMeshToCadGeneration(
     opts.runsRoot ?? process.env["PROCEDURA_OUTPUTS_ROOT"] ?? join(PROCEDURA_ROOT, "outputs"),
   );
   if (!isInside(outputDir, runsRoot)) throw new Error("outputDir must be inside runsRoot");
+  const reuseDraftPlan = existsSync(join(outputDir, "plan.json")) &&
+    existsSync(join(outputDir, "draft.scad"));
   for (const file of STALE_FILES) rmSync(resolve(outputDir, file), { force: true });
   for (const dir of STALE_DIRS) rmSync(resolve(outputDir, dir), { recursive: true, force: true });
   const planned = await planReferenceRun({
     ...planOpts,
     ...(refine ? { referenceViews: REFINE_REFERENCE_VIEWS } : {}),
+    ...(reuseDraftPlan ? { reuseExistingPlan: true } : {}),
     maxParts: 0,
   });
   const imagePath = resolve(planned.outputDir, "image.png");

@@ -11,6 +11,22 @@ preparation script below is that trusted host for one retained local run and is
 not registered with Procedura. Outputs contain reconstructive cell data and
 must remain private; they are not an Agent prompt or public run artifact.
 
+## Layout
+
+- `octree_mapping/`: solver, data contracts, mesh adapter, and installed CLI.
+- `scripts/`: reusable host-side CLI scripts for private mapping-input preparation.
+- `examples/`: deterministic fixture builder and catalog; see the
+  [example and script commands](examples/README.md).
+- `validation/`: controlled full-run fixture and review builders, black-box
+  acceptance scenarios, and the frozen Plan 4 ablation.
+- `archive/`: superseded experiment prototypes retained only for historical
+  reproduction.
+
+Generated artifacts stay under `outputs/` or an explicitly supplied output path.
+The package name, installed CLI, and input/report schemas are unchanged. Direct
+script invocations now use `scripts/` or `validation/`; the old root-level
+`prepare_plan4_shadow.py` is now `scripts/prepare_mapping_input.py`.
+
 ## Setup and run
 
 ```bash
@@ -55,7 +71,7 @@ name and sets the UOT KL marginal penalty in finest-cell units. The default `1/0
 penalty 8 profile is mathematically the prior position-only solver. No semantic part provenance
 is read by candidate generation, costs, support, or Sinkhorn or included in the output.
 
-For the retained Plan 4 transformer validation, `prepare_plan4_shadow.py`
+For the retained Plan 4 transformer validation, `scripts/prepare_mapping_input.py`
 converts the private GT OBJ, final candidate OBJ, canonical whole STL, and the
 renderer-retained per-part STL manifest into that same contract. It uses the
 fixed `[-1, 1]^3` root, verifies whole STL/OBJ frame identity, and applies the
@@ -71,7 +87,7 @@ transform, time, and peak memory without containing node geometry.
 The real-data ablation writes four private reports plus one aggregate summary:
 
 ```bash
-.venv/bin/python run_plan4_ablation.py \
+.venv/bin/python validation/run_plan4_ablation.py \
   --input /tmp/plan4-depth6-mapping-input-v2.json \
   --output-dir /tmp/plan4-geometric-ablation \
   --summary /tmp/plan4-geometric-ablation-summary.json
@@ -87,7 +103,7 @@ validation artifacts.
 ## Black-box acceptance
 
 ```bash
-.venv/bin/python validate_scenarios.py
+.venv/bin/python validation/validate_scenarios.py
 ```
 
 This command runs the installed CLI on generated end-to-end scenarios. It is

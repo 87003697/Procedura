@@ -1,4 +1,4 @@
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { Buffer } from "node:buffer";
 
@@ -39,6 +39,8 @@ export interface PlanReferenceRunOpts {
   referenceRoot?: string;
   runsRoot?: string;
   maxParts?: number;
+  /** Reuse the plan paired with an existing draft, complete or incomplete. */
+  reuseExistingPlan?: boolean;
   /** Ordered render views. The first view is the authoritative image.png. */
   referenceViews?: readonly ViewName[];
 }
@@ -95,6 +97,16 @@ export async function planReferenceRun(opts: PlanReferenceRunOpts): Promise<Plan
     writeFileSync(path, image.bytes);
     return { view: image.view, path };
   });
+
+  const existingPlanPath = join(imported.outputDir, "plan.json");
+  if (opts.reuseExistingPlan && existsSync(existingPlanPath)) {
+    const plan = parsePlanJson(
+      readFileSync(existingPlanPath, "utf8"),
+      opts.maxParts ?? DEFAULT_MAX_PARTS,
+      { assembly: true },
+    );
+    return { ...imported, plan, referenceImages };
+  }
 
   const summary = JSON.stringify(imported.summary);
   const planPrompt =

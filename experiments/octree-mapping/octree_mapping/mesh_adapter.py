@@ -196,9 +196,11 @@ def surface_cells(
 
 
 def load_part_manifest(path: str | Path) -> dict[str, Path]:
+    manifest = Path(path)
     parts: dict[str, Path] = {}
-    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    lines = manifest.read_text(encoding="utf-8").splitlines()
     for line in lines[1:]:
         name, _red, _green, _blue, stl_path = line.split("\t")
-        parts[name] = Path(stl_path)
+        part_path = Path(stl_path)
+        parts[name] = part_path if part_path.is_absolute() else manifest.parent / part_path
     return parts

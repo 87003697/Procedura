@@ -35,7 +35,7 @@ export async function normalizeReference(
     return;
   }
 
-  const script = resolve(dirname(new URL(import.meta.url).pathname), "../../scripts/_normalize_reference_blender.py");
+  const script = resolve(dirname(new URL(import.meta.url).pathname), "./_normalize_reference_blender.py");
   await new Promise<void>((resolvePromise, reject) => {
     const child = spawn(
       blenderBin(),
