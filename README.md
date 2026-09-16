@@ -87,7 +87,7 @@ Model selection is just a string. Any id your endpoint serves works, whether or
 not this repo has heard of it:
 
 ```bash
-PROCEDURA_MODEL=gpt-5.2                      # via the openai provider
+PROCEDURA_MODEL=gpt-5.5                      # via the openai provider
 PROCEDURA_MODEL=gemini:gemini-3-pro-preview  # force the native Gemini transport
 ```
 
@@ -163,7 +163,8 @@ programmatic callers may select additional named views from the existing view
 catalog, with the first view remaining authoritative. Plan 2's planner receives
 only those public images and the bounded Z-up/mm geometry summary, and writes
 `plan.json`. Plan 3's incremental generator receives the same public images and
-`plan.json`.
+`plan.json`, then uses the upstream per-part retries, plan reviewer,
+connectivity gate, and incomplete-draft resume behavior.
 Neither call receives the reference handle, private canonical Mesh, source
 bytes or paths, manifest, materials, textures, or host metadata. The command
 retains `reference.json`, `image.png`, and `plan.json`, and adds `final.scad`
@@ -172,12 +173,12 @@ and `final.obj` on success. Selected supplementary views are retained as
 geometry-only binary STL in Z-up millimetres; STL/OBJ/PLY retain their
 preconditioned coordinates, while glTF/GLB convert Y-up/metres to
 Z-up/millimetres.
-Without `--refine`, Mesh-to-CAD promotes the Plan 3 draft without review. With
+Without `--refine`, Mesh-to-CAD promotes the Plan 3 draft without the Phase 2 whole-model review. With
 `--refine`, the same unified pipeline uses Procedura's existing direct
 compile/critic/patch/gate loop and writes its normal `_refine_steps/`,
 `preview_final/`, and `final_summary.txt` artifacts. This is image-space review,
-not 3D source-to-generated measurement. The default path has no refine or repair
-loop, closed-loop iteration, four-view/brief/scoring workflow,
+not 3D source-to-generated measurement. The default path has no whole-model
+refine loop, closed-loop iteration, four-view/brief/scoring workflow,
 STEP/build123d, or material/texture processing.
 
 ### The best-quality run
