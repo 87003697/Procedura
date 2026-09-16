@@ -39,7 +39,7 @@ export interface PlanReferenceRunOpts {
   referenceRoot?: string;
   runsRoot?: string;
   maxParts?: number;
-  /** Reuse an existing plan when resuming an incomplete draft. */
+  /** Reuse the plan paired with an existing draft, complete or incomplete. */
   reuseExistingPlan?: boolean;
   /** Ordered render views. The first view is the authoritative image.png. */
   referenceViews?: readonly ViewName[];

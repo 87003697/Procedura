@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   planReferenceRun,
@@ -28,23 +28,6 @@ function isInside(path: string, root: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-function isIncompleteDraft(dir: string): boolean {
-  const planPath = join(dir, "plan.json");
-  const scadPath = join(dir, "draft.scad");
-  if (!existsSync(planPath) || !existsSync(scadPath)) return false;
-  try {
-    const plan = JSON.parse(readFileSync(planPath, "utf8")) as unknown[];
-    if (!Array.isArray(plan) || plan.length === 0) return false;
-    const partsDir = join(dir, "_parts");
-    if (!existsSync(partsDir)) return true;
-    const committed = readdirSync(partsDir)
-      .filter((part) => existsSync(join(partsDir, part, "after_gen.scad"))).length;
-    return committed < plan.length;
-  } catch {
-    return false;
-  }
-}
-
 export async function runMeshToCadGeneration(
   opts: PlanReferenceRunOpts & { refine?: boolean },
 ): Promise<PlanReferenceRunResult> {
@@ -57,13 +40,14 @@ export async function runMeshToCadGeneration(
     opts.runsRoot ?? process.env["PROCEDURA_OUTPUTS_ROOT"] ?? join(PROCEDURA_ROOT, "outputs"),
   );
   if (!isInside(outputDir, runsRoot)) throw new Error("outputDir must be inside runsRoot");
-  const resumeDraft = isIncompleteDraft(outputDir);
+  const reuseDraftPlan = existsSync(join(outputDir, "plan.json")) &&
+    existsSync(join(outputDir, "draft.scad"));
   for (const file of STALE_FILES) rmSync(resolve(outputDir, file), { force: true });
   for (const dir of STALE_DIRS) rmSync(resolve(outputDir, dir), { recursive: true, force: true });
   const planned = await planReferenceRun({
     ...planOpts,
     ...(refine ? { referenceViews: REFINE_REFERENCE_VIEWS } : {}),
-    ...(resumeDraft ? { reuseExistingPlan: true } : {}),
+    ...(reuseDraftPlan ? { reuseExistingPlan: true } : {}),
     maxParts: 0,
   });
   const imagePath = resolve(planned.outputDir, "image.png");
