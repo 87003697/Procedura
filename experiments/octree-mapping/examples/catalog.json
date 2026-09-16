@@ -1,0 +1,22 @@
+{
+  "schema": "procedura.octree-mapping-example-catalog/1",
+  "frame": {
+    "minMm": [-1.0, -1.0, -1.0],
+    "sideMm": 2.0,
+    "maxDepth": 6
+  },
+  "examples": [
+    {"id": "snake-arm", "directory": "01-snake-arm", "status": "implemented"},
+    {"id": "miura-solar-sail", "directory": "02-miura-solar-sail", "status": "implemented"},
+    {"id": "vault-city", "directory": "03-vault-city", "status": "implemented"},
+    {"id": "bat-wing", "directory": "04-bat-wing", "status": "implemented"},
+    {"id": "blind-labyrinth", "directory": "05-blind-labyrinth", "status": "implemented"},
+    {"id": "branching-vessel", "directory": "06-branching-vessel", "status": "implemented"},
+    {"id": "wormgear-planet", "directory": "07-wormgear-planet", "status": "implemented"},
+    {"id": "nautilus-shell", "directory": "08-nautilus-shell", "status": "implemented"},
+    {"id": "mechanical-flower", "directory": "09-mechanical-flower", "status": "implemented"},
+    {"id": "mobius-repair-band", "directory": "10-mobius-repair-band", "status": "implemented"},
+    {"id": "gyroid-material", "directory": "11-gyroid-material", "status": "implemented"},
+    {"id": "breathing-octopus", "directory": "12-breathing-octopus", "status": "implemented"}
+  ]
+}

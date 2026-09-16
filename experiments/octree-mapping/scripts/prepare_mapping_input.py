@@ -1,4 +1,4 @@
-"""Prepare the retained Plan 4 transformer robot for the private shadow mapper."""
+"""Prepare aligned reference and candidate meshes for the private shadow mapper."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ def bounds(mesh) -> dict[str, list[float]]:
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="Prepare private Plan 4 depth-6 surface cells")
+    result = argparse.ArgumentParser(description="Prepare private mapping surface cells")
     result.add_argument("--gt-obj", required=True)
     result.add_argument("--candidate-obj", required=True)
     result.add_argument("--candidate-stl", required=True)
