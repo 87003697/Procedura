@@ -1,0 +1,527 @@
+diff --git a/experiments/octree-mapping/README.md b/experiments/octree-mapping/README.md
+index 37b2fa6..a030868 100644
+--- a/experiments/octree-mapping/README.md
++++ b/experiments/octree-mapping/README.md
+@@ -113,3 +113,33 @@ mixed provenance below input max depth, and a bounded depth-8 case.
+ It also covers normal and occupancy-neighborhood geometric disambiguation.
+ Each successful case also checks the exact compact field sets, complete solved-depth
+ coverage, array counts, derivable parent prefixes, and millimetre displacement vectors.
++
++## Mapping critic in direct refine
++
++The direct refine loop can accept an optional `MappingCritic` with the same outer
++shape as the visual critic: it receives the current cycle's SCAD, compiled STL,
++parts-colour views, legend, and step directory, then returns one Mapping text
++feedback string. The host adapter is responsible for preparing the current
++candidate/target octree `input` and `report`, the existing `plan.json` semantic
++plan, and the front/top/right candidate/comparison images required by
++`runMappingAgent`.
++
++```ts
++import { makeMappingCritic } from "../../src/pipeline/mapping-critic.ts";
++
++const mappingCritic = makeMappingCritic(async (context) => {
++  const current = await prepareCurrentMappingInput(context);
++  return {
++    source: current.source,
++    semanticPlan: current.semanticPlan,
++    vision: current.vision,
++  };
++});
++```
++
++Pass that callback through the Mesh-to-CAD host or `runProcedura`. Each cycle must
++prepare the Mapping source from the `context.stlPath` for that cycle. The Mapping
++Agent returns the plain-text diagnosis consumed by refine; its input schema,
++bounded facts, plan coverage, and optional inspection-tool argument checks remain
++inside the Mapping path. The refine path does not parse a Mapping JSON artifact.
++Without a Mapping critic, ordinary visual direct refine is unchanged.
+diff --git a/src/agents_mesh2code/mapping-agent.ts b/src/agents_mesh2code/mapping-agent.ts
+index e8ddb5d..d775eaa 100644
+--- a/src/agents_mesh2code/mapping-agent.ts
++++ b/src/agents_mesh2code/mapping-agent.ts
+@@ -9,19 +9,15 @@ import { buildMappingEvidence, resetMappingEvidenceExposure, type MappingEvidenc
+ import { makeInspectMappingPartTool } from "./mapping-inspect-tool.ts";
+ import { buildMappingArrowSummaries } from "./mapping-arrow-summary.ts";
+ import { buildMappingVisionParts, type MappingVisionInput } from "./mapping-vision.ts";
+-import { parseMappingFeedbackArtifact, type MappingFeedbackArtifact } from "./mapping-feedback-schema.ts";
+-
+-export interface MappingAgentResult { artifact: MappingFeedbackArtifact }
+
+ const SYSTEM = [
+   "You are a standalone mapping evaluator.",
+   "Use semanticPlan descriptions, Blender per-part-color candidate views, aligned GT/candidate comparison views, and bounded part-level arrow summaries. Vision identifies the candidate geometry overlapping a discrepancy; arrow summaries support direction and coherent region merging; bounded mapping evidence supports the final diagnosis. GT has no part provenance, so candidatePartIds are region overlap labels, not claims that every listed part moved.",
+   "Each arrow summary aggregates the candidate-to-GT residuals for one candidate part. Treat displacementMm as the correction vector to apply to the candidate: candidate → GT. Never invert its sign or replace it with an ambiguous front/back description. State repairHint with explicit axis deltas when possible. Use direction coherence to down-rank weak residuals and merge adjacent parts with the same direction. When coherence is low or directions conflict, inspect the known part before creating or expanding a region; if the bounded inspection remains incoherent or lacks visual support, do not promote it to a primary region. A displacement is not proof that the owning part moved; use bounded evidence to ground diagnosis and repairHint.",
+-  "If the initial evidence is insufficient, call inspect_mapping_part with a known partId and evidenceId. Omit radiusMm/depth first to judge the default coarse parent octree region (two levels coarser than finest); use the finest depth or a smaller radius only when that coarse summary remains ambiguous. Continue inspecting known parts as needed; stop when the evidence is sufficient and return the final artifact.",
+-  "Return at most two region observations. Return only JSON with this shape: {schemaVersion:5,status:\"ok\"|\"insufficient-evidence\",regions:[{candidatePartIds:string[],evidenceIds:string[],diagnosis:string,repairHint:string}]}. status is ok exactly when regions is non-empty and insufficient-evidence exactly when regions is empty.",
++  "If the initial evidence is insufficient, call inspect_mapping_part with a known partId and evidenceId. Omit radiusMm/depth first to judge the default coarse parent octree region (two levels coarser than finest); use the finest depth or a smaller radius only when that coarse summary remains ambiguous. Continue inspecting known parts as needed; stop when the evidence is sufficient and return the final text diagnosis.",
++  "Return at most two region observations as plain text. Use this structure: STATUS: ok|insufficient-evidence, then for each region write REGION N, [modules: ...], [evidence: ...], MAPPING: ..., and FIX: .... status is ok when at least one supported region exists and insufficient-evidence when no region is supported. Output only this diagnosis text with no JSON, Markdown fence, or extra preamble.",
+   "If vision and mapping cannot support a region-level conclusion, return insufficient-evidence. Do not claim unsupported source-code locations, raw mesh, or pass/fail authority.",
+ ].join(" ");
+-const MAX_JSON_ATTEMPTS = 2;
+ const client = createLLMClient({ fetch: longTimeoutFetch, maxAttempts: 1 });
+
+ function parseSemanticPlan(value: unknown): JsonObject[] {
+@@ -42,26 +38,6 @@ function validatePlanCoverage(partIds: Set<string>, plan: JsonObject[]): void {
+   if (missing) throw Error(`mapping partId not found in plan.json: ${missing}`);
+ }
+
+-function validateArtifact(artifact: MappingFeedbackArtifact, evidence: MappingEvidence): MappingFeedbackArtifact {
+-  for (const region of artifact.regions) {
+-    for (const partId of region.candidatePartIds) {
+-      if (!evidence.partIds.has(partId)) throw Error(`mapping region references unknown part: ${partId}`);
+-    }
+-    for (const evidenceId of region.evidenceIds) {
+-      if (!evidence.exposedEvidenceIds.has(evidenceId)) throw Error(`mapping issue references evidence not supplied: ${evidenceId}`);
+-      const owner = evidence.evidenceOwners.get(evidenceId);
+-      if (!owner) throw Error(`mapping issue references unknown evidence: ${evidenceId}`);
+-      if (!region.candidatePartIds.includes(owner)) throw Error(`mapping evidence owner ${owner} is outside region candidates`);
+-    }
+-  }
+-  return artifact;
+-}
+-
+-function parseArtifactResponse(text: string, evidence: MappingEvidence): MappingFeedbackArtifact {
+-  const clean = text.trim().replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "");
+-  return validateArtifact(parseMappingFeedbackArtifact(clean), evidence);
+-}
+-
+ function parseToolCalls(events: LLMEvent[]): { text: string; calls: Array<{ id: string; name: string; input: JsonObject }> } {
+   const text = events.filter((event) => event.kind === "text-delta").map((event) => event.text).join("");
+   const pending = new Map<string, { name: string; args: string; input?: JsonObject }>();
+@@ -130,25 +106,12 @@ async function readCells(source: MappingFactsSource): Promise<JsonObject[]> {
+   return cells;
+ }
+
+-export async function runMappingAgent(args: { source: MappingFactsSource; semanticPlan: unknown; vision: MappingVisionInput; route: RouteDef<unknown>; model: ModelRef; signal?: AbortSignal }): Promise<MappingAgentResult> {
++export async function runMappingAgent(args: { source: MappingFactsSource; semanticPlan: unknown; vision: MappingVisionInput; route: RouteDef<unknown>; model: ModelRef; signal?: AbortSignal }): Promise<string> {
+   const semanticPlan = parseSemanticPlan(args.semanticPlan);
+   const evidence = buildMappingEvidence(await readCells(args.source));
+   validatePlanCoverage(evidence.partIds, semanticPlan);
+   const inspectTool = makeInspectMappingPartTool(evidence);
+   const facts: JsonObject = { semanticPlan, partArrowSummaries: buildMappingArrowSummaries(evidence) };
+   const visionParts = await buildMappingVisionParts(args.vision);
+-  let lastParseError: Error | undefined;
+-  for (let attempt = 1; attempt <= MAX_JSON_ATTEMPTS; attempt++) {
+-    const system = attempt === 1
+-      ? SYSTEM
+-      : `${SYSTEM}\n\nYour previous response failed local JSON validation: ${lastParseError?.message ?? "invalid JSON"}. Return a complete replacement artifact now. Output only valid JSON with no Markdown fence, prose, or extra fields.`;
+-    const response = await generateMappingResponse({ route: args.route, model: args.model, system, facts, visionParts, evidence, inspectTool, signal: args.signal });
+-    try {
+-      return { artifact: parseArtifactResponse(response, evidence) };
+-    } catch (error) {
+-      lastParseError = error instanceof Error ? error : Error(String(error));
+-      if (attempt === MAX_JSON_ATTEMPTS) throw lastParseError;
+-    }
+-  }
+-  throw lastParseError ?? Error("mapping response was not parsed");
++  return generateMappingResponse({ route: args.route, model: args.model, system: SYSTEM, facts, visionParts, evidence, inspectTool, signal: args.signal });
+ }
+diff --git a/src/agents_mesh2code/mapping-feedback-schema.ts b/src/agents_mesh2code/mapping-feedback-schema.ts
+deleted file mode 100644
+index a105f9d..0000000
+--- a/src/agents_mesh2code/mapping-feedback-schema.ts
++++ /dev/null
+@@ -1,53 +0,0 @@
+-/** Closed parser for Mapping Agent feedback. */
+-export type FeedbackStatus = "ok" | "insufficient-evidence";
+-export interface MappingFeedbackRegion { candidatePartIds: string[]; evidenceIds: string[]; diagnosis: string; repairHint: string; }
+-export interface MappingFeedbackArtifact { schemaVersion: 5; status: FeedbackStatus; regions: MappingFeedbackRegion[]; }
+-const statuses: FeedbackStatus[] = ["ok", "insufficient-evidence"];
+-function assert(condition: unknown, message: string): asserts condition { if (!condition) throw Error(message); }
+-function object(value: unknown, label: string): Record<string, unknown> {
+-  assert(value && typeof value === "object" && !Array.isArray(value), label);
+-  return value as Record<string, unknown>;
+-}
+-function parseJson(text: string): unknown { try { return JSON.parse(text); } catch { throw Error("invalid artifact JSON"); } }
+-function keys(value: Record<string, unknown>, allowed: readonly string[], label: string): void {
+-  assert(Object.keys(value).every((key) => allowed.includes(key)), label);
+-}
+-function nonEmptyString(value: unknown, label: string): asserts value is string {
+-  assert(typeof value === "string" && value.trim().length > 0, label);
+-}
+-function evidenceIds(value: unknown): string[] {
+-  assert(Array.isArray(value) && value.length > 0, "invalid evidence references");
+-  const ids = value.map((id) => {
+-    nonEmptyString(id, "invalid evidence reference");
+-    return id;
+-  });
+-  assert(new Set(ids).size === ids.length, "duplicate evidence reference");
+-  return ids;
+-}
+-export function parseMappingFeedbackArtifact(text: string): MappingFeedbackArtifact {
+-  const root = object(parseJson(text), "invalid artifact");
+-  keys(root, ["schemaVersion", "status", "regions"], "unknown artifact field");
+-  assert(root.schemaVersion === 5 && statuses.includes(root.status as FeedbackStatus), "invalid artifact header");
+-  assert(Array.isArray(root.regions), "regions must be an array");
+-  const status = root.status as FeedbackStatus;
+-  assert(root.regions.length <= 2, "too many regions");
+-  const regions = root.regions.map((value): MappingFeedbackRegion => {
+-    const item = object(value, "invalid region");
+-    keys(item, ["candidatePartIds", "evidenceIds", "diagnosis", "repairHint"], "invalid region");
+-    const candidatePartIds = item.candidatePartIds;
+-    assert(Array.isArray(candidatePartIds) && candidatePartIds.length > 0, "invalid region candidates");
+-    const partIds = candidatePartIds.map((partId) => {
+-      nonEmptyString(partId, "invalid region candidate");
+-      return partId;
+-    });
+-    assert(new Set(partIds).size === partIds.length, "duplicate region candidate");
+-    const diagnosis = item.diagnosis;
+-    nonEmptyString(diagnosis, "invalid diagnosis");
+-    const repairHint = item.repairHint;
+-    nonEmptyString(repairHint, "invalid repair hint");
+-    const references = evidenceIds(item.evidenceIds);
+-    return { candidatePartIds: partIds, evidenceIds: references, diagnosis, repairHint };
+-  });
+-  assert((status === "insufficient-evidence") === (regions.length === 0), "status does not match regions");
+-  return { schemaVersion: 5, status, regions };
+-}
+diff --git a/src/pipeline/procedura.ts b/src/pipeline/procedura.ts
+index 027a804..2e7e0f7 100644
+--- a/src/pipeline/procedura.ts
++++ b/src/pipeline/procedura.ts
+@@ -33,6 +33,7 @@ import { runDraft, type DraftResult } from "./draft.ts";
+ import { runIncrementalDraft, type IncrementalDraftResult } from "./draft-incremental.ts";
+ import { runRefine, type RefineResult } from "./refine.ts";
+ import { runDirectRefine } from "./refine-direct.ts";
++import type { MappingCritic } from "./mapping-critic.ts";
+ import { runPaint, type PaintResult } from "./paint.ts";
+ import { runMotionExport, type MotionExportResult } from "./motion.ts";
+ import type { MotionCollisionApproximation } from "../motion/types.ts";
+@@ -124,6 +125,8 @@ export interface RunProceduraOpts {
+    * the final model: draft.{scad,stl,obj} are promoted to final.* and a
+    * synthetic verdict="skipped" RefineResult is returned (no refine loop). */
+   refine?: boolean;
++  /** Optional Mapping critic for each direct-refine cycle. */
++  mappingCritic?: MappingCritic;
+   /** Persist the binary STL deliverable (draft.stl / final.stl) alongside the
+    * OBJ. Default false — only the normalized OBJ (+ SCAD) is exported; STL is
+    * kept in internal build dirs for connectivity/rendering. */
+@@ -377,6 +380,7 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
+         : await runDirectRefine({
+             ...refineOpts,
+             ...(opts.externalExecution?.inputImages !== undefined ? { referenceImages: opts.externalExecution.inputImages } : {}),
++            ...(opts.mappingCritic !== undefined ? { mappingCritic: opts.mappingCritic } : {}),
+           });
+     }
+
+diff --git a/src/pipeline/refine-direct.ts b/src/pipeline/refine-direct.ts
+index fe7a299..6752b8a 100644
+--- a/src/pipeline/refine-direct.ts
++++ b/src/pipeline/refine-direct.ts
+@@ -21,7 +21,8 @@
+  *
+  * So the sequence is code now, and the model does the two things that actually
+  * need judgement: **what is wrong** (critic) and **what the corrected code is**
+- * (patch). Two LLM calls per cycle, no tools, no transcript growth across
++ * (patch). The default cycle has two LLM calls; an opted-in Mapping critic adds
++ * one parallel evaluator call. There are no tools or transcript growth across
+  * cycles — each patch call is fresh, so a long refine can't blow the window.
+  *
+  * ## The cycle
+@@ -59,6 +60,7 @@ import { parsePatchResponse, applyPatch } from "./refine-patch.ts";
+ import { writeFinalOutputs, DEFAULT_REFINE_STEPS } from "./refine.ts";
+ import type { RefineOpts, RefineResult } from "./refine.ts";
+ import { timeStage } from "./stage-timer.ts";
++import type { CriticFeedback, MappingCritic } from "./mapping-critic.ts";
+
+ const DIAGNOSE_PROMPT_PATH = new URL("./diagnose-prompt.md", import.meta.url).pathname;
+ const PATCH_PROMPT_PATH = new URL("./refine-patch-prompt.md", import.meta.url).pathname;
+@@ -240,6 +242,8 @@ async function measureModules(
+ export interface DirectRefineOpts extends RefineOpts {
+   /** Explicit ordered references supplied by the unified pipeline. */
+   referenceImages?: readonly { label: string; path: string }[];
++  /** Optional Mapping critic using the same committed CAD state as visual critic. */
++  mappingCritic?: MappingCritic;
+ }
+
+ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineResult> {
+@@ -293,15 +297,8 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
+   log(`  refine-steps:  ${state.refineStepsDir}`);
+   log(``);
+
+-  // The STL for the CURRENT buffer, or null when it needs (re)building.
+-  //
+-  // Deliberately not state.latestStlPath: that field is pre-seeded with
+-  // draft.stl, which is a LAZY-UNION export. Overlapping solids are left
+-  // unmerged there, so its facet count is not comparable to a normal compile's
+-  // — using it as the regression baseline would make the very first patch look
+-  // like it destroyed detail and get it thrown away. Starting at null forces
+-  // one honest compile before the first comparison, and every later cycle
+-  // reuses the STL the patch verification already produced.
++  // The STL for the CURRENT buffer. It is rebuilt at the start of every cycle
++  // so both critics always review the same freshly compiled geometry.
+   let builtStl: string | null = null;
+   /** Consecutive cycles that accepted nothing. */
+   let barren = 0;
+@@ -318,26 +315,18 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
+     log(`--- cycle ${cycle}/${maxCycles} ---`);
+
+     // ── 1. Compile + render. Not a decision: it happens every cycle. ──────
+-    // The compile is only needed for the facet baseline (connectivity does its
+-    // own union-wrapped compile, and the renderer works from the source), so
+-    // skip it when the buffer is already built: after an accepted patch we
+-    // compiled that exact buffer to verify it, and after a rejected cycle the
+-    // buffer never changed. That is one full compile per cycle saved on a model
+-    // whose STL runs to tens of megabytes.
+     const compileDir = join(state.agentCompilesDir, `cycle_${pad(cycle)}`);
+-    if (builtStl === null) {
+-      mkdirSync(compileDir, { recursive: true });
+-      try {
+-        const r = await timeStage("openscad.refine", () => compileScad(state.scad, { outputDir: compileDir }));
+-        builtStl = r.stlPath;
+-        state.latestStlPath = r.stlPath;
+-        state.stlIsStale = false;
+-      } catch (e) {
+-        // The buffer we were handed does not build. Nothing downstream helps.
+-        log(`  compile failed on entry: ${(e as Error).message.slice(0, 200)}`);
+-        verdict = "error";
+-        break;
+-      }
++    mkdirSync(compileDir, { recursive: true });
++    try {
++      const r = await timeStage("openscad.refine", () => compileScad(state.scad, { outputDir: compileDir }));
++      builtStl = r.stlPath;
++      state.latestStlPath = r.stlPath;
++      state.stlIsStale = false;
++    } catch (e) {
++      // The current buffer does not build. Nothing downstream helps.
++      log(`  compile failed on entry: ${(e as Error).message.slice(0, 200)}`);
++      verdict = "error";
++      break;
+     }
+
+     const viewsDir = join(stepDir, "views");
+@@ -358,7 +347,7 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
+     state.latestViewsScad = state.scad;
+     await ensureConnectivity(state);
+
+-    // ── 2. Critic. ────────────────────────────────────────────────────────
++    // ── 2. Critics. Both review the same compiled/rendered CAD state. ─────
+     const criticParts: CanonicalPart[] = [
+       { kind: "text", text: buildDiagnoseLeadText(state, { fixerHasTools: false }) },
+       ...referenceParts,
+@@ -373,28 +362,62 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
+         "Return ONLY the diagnosis block in the format your system prompt specifies.",
+     });
+
++    const mappingContext = {
++      cycle,
++      workspaceDir: workspace.rootDir,
++      stepDir,
++      scad: state.scad,
++      stlPath: builtStl!,
++      views: state.latestViews,
++      partsColorLegend: state.partsColorLegend,
++    };
++
++    const visualPromise = timeStage("llm.critic", () => generateWithRetry({
++      route, model, system: criticSystem, parts: criticParts,
++      label: `critic c${cycle}`, ...(opts.signal ? { signal: opts.signal } : {}),
++    }));
++    const mappingPromise = opts.mappingCritic
++      ? timeStage("llm.mapping-critic", () => opts.mappingCritic!({
++          context: mappingContext,
++          route,
++          model,
++          ...(opts.signal ? { signal: opts.signal } : {}),
++        }))
++      : Promise.resolve(null);
++
+     let diagnosis: string;
++    let visualFeedback: CriticFeedback;
++    let mappingFeedback: CriticFeedback | null;
+     try {
+-      const r = await timeStage("llm.critic", () => generateWithRetry({
+-        route, model, system: criticSystem, parts: criticParts,
+-        label: `critic c${cycle}`, ...(opts.signal ? { signal: opts.signal } : {}),
+-      }));
+-      llmCalls += 1;
+-      diagnosis = r.text.trim();
++      const [visualResult, mappingResult] = await Promise.all([visualPromise, mappingPromise]);
++      llmCalls += opts.mappingCritic ? 2 : 1;
++      visualFeedback = {
++        text: visualResult.text.trim(),
++        actionable: hasHighIssue(visualResult.text),
++      };
++      mappingFeedback = mappingResult;
++      const mappingDiagnosis = mappingFeedback?.text.trim() ?? "";
++      diagnosis = mappingDiagnosis
++        ? "=== VISUAL CRITIC ===\n" + visualFeedback.text + "\n\n=== MAPPING CRITIC ===\n" + mappingDiagnosis
++        : visualFeedback.text;
+       writeFileSync(join(stepDir, "diagnosis.txt"), diagnosis, "utf8");
+-      if (r.reasoning) writeFileSync(join(stepDir, "diagnose_thinking.txt"), r.reasoning, "utf8");
++      if (visualResult.reasoning) writeFileSync(join(stepDir, "diagnose_thinking.txt"), visualResult.reasoning, "utf8");
++      if (mappingDiagnosis) writeFileSync(join(stepDir, "mapping.txt"), mappingDiagnosis, "utf8");
+     } catch (e) {
+       log(`  critic failed: ${(e as Error).message.slice(0, 200)} — ending refine`);
+       break;
+     }
+
+-    const summaryLine = diagnosis.split("\n").find((l) => /^\s*summary:/i.test(l)) ?? diagnosis.slice(0, 120);
++    const visualDiagnosis = visualFeedback.text;
++    const mappingDiagnosis = mappingFeedback?.text.trim() ?? "";
++
++    const summaryLine = visualDiagnosis.split("\n").find((l) => /^\s*summary:/i.test(l)) ?? visualDiagnosis.slice(0, 120);
+     summary = summaryLine.replace(/^\s*summary:\s*/i, "").trim();
+     state.diagnosisHistory.push({ cycle, summary, raw: diagnosis });
+     log(`  critic: ${summary.slice(0, 160)}`);
+
+-    if (!hasHighIssue(diagnosis)) {
+-      log(`  no HIGH issues remain — finishing`);
++    if (!visualFeedback.actionable && !(mappingFeedback?.actionable ?? false)) {
++      log(`  no actionable critic issues remain — finishing`);
+       verdict = "ok";
+       break;
+     }
+@@ -435,7 +458,7 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
+               : "") +
+             (workspace.hasImage
+               ? "The reference image and the current build views follow, then the full "
+-              : "The target specification and the current build views follow, then the full ") + +
++              : "The target specification and the current build views follow, then the full ") +
+             "SCAD source, then the reviewer's diagnosis.",
+         },
+         ...referenceParts,
+@@ -459,7 +482,9 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
+         kind: "text",
+         text:
+           (repairNote ? `=== YOUR PREVIOUS ATTEMPT FAILED — FIX IT ===\n${repairNote}\n\n` : "") +
+-          "Fix the highest-severity issue. Emit only the patch blocks.",
++          (mappingDiagnosis
++            ? "Consider both critic feedback blocks together. Fix the highest-severity supported issue and emit only the patch blocks."
++            : "Fix the highest-severity issue. Emit only the patch blocks."),
+       });
+
+       let raw: string;
+diff --git a/src/pipeline_mesh2code/mesh-to-cad-generation.ts b/src/pipeline_mesh2code/mesh-to-cad-generation.ts
+index e0f0581..e709705 100644
+--- a/src/pipeline_mesh2code/mesh-to-cad-generation.ts
++++ b/src/pipeline_mesh2code/mesh-to-cad-generation.ts
+@@ -6,6 +6,7 @@ import {
+   type PlanReferenceRunResult,
+ } from "./mesh-to-cad-plan.ts";
+ import { runMeshToCadProcedura } from "./procedura_adapter.ts";
++import type { MappingCritic } from "../pipeline/mapping-critic.ts";
+ import type { ViewName } from "../render/views.ts";
+
+ const PROCEDURA_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..", "..");
+@@ -29,9 +30,9 @@ function isInside(path: string, root: string): boolean {
+ }
+
+ export async function runMeshToCadGeneration(
+-  opts: PlanReferenceRunOpts & { refine?: boolean },
++  opts: PlanReferenceRunOpts & { refine?: boolean; mappingCritic?: MappingCritic },
+ ): Promise<PlanReferenceRunResult> {
+-  const { refine = false, ...planOpts } = opts;
++  const { refine = false, mappingCritic, ...planOpts } = opts;
+   const outputDir = resolve(opts.outputDir);
+   if (existsSync(outputDir) && !statSync(outputDir).isDirectory()) {
+     throw new Error("outputDir must be a directory");
+@@ -65,6 +66,7 @@ export async function runMeshToCadGeneration(
+       path: image.path,
+     })),
+     refine,
++    ...(mappingCritic !== undefined ? { mappingCritic } : {}),
+   });
+   const finalScad = resolve(outputDir, "final.scad");
+   const finalObj = resolve(outputDir, "final.obj");
+diff --git a/src/pipeline_mesh2code/procedura_adapter.ts b/src/pipeline_mesh2code/procedura_adapter.ts
+index db7372a..623b893 100644
+--- a/src/pipeline_mesh2code/procedura_adapter.ts
++++ b/src/pipeline_mesh2code/procedura_adapter.ts
+@@ -1,4 +1,5 @@
+ import { runProcedura, type RunProceduraResult } from "../pipeline/procedura.ts";
++import type { MappingCritic } from "../pipeline/mapping-critic.ts";
+
+ /** Inputs owned by the Mesh-to-CAD host when invoking the Procedura pipeline. */
+ export interface MeshToCadProceduraOpts {
+@@ -7,6 +8,7 @@ export interface MeshToCadProceduraOpts {
+   planText: string;
+   referenceImages: readonly { label: string; path: string }[];
+   refine: boolean;
++  mappingCritic?: MappingCritic;
+ }
+
+ /**
+@@ -34,5 +36,6 @@ export function runMeshToCadProcedura(
+       draftPromotion: "open-loop",
+     },
+     refine: opts.refine,
++    ...(opts.mappingCritic !== undefined ? { mappingCritic: opts.mappingCritic } : {}),
+   });
+ }
+diff --git a/src/pipeline/mapping-critic.ts b/src/pipeline/mapping-critic.ts
+new file mode 100644
+index 0000000..b514d1e
+--- /dev/null
++++ b/src/pipeline/mapping-critic.ts
+@@ -0,0 +1,68 @@
++import type { ModelRef } from "@harness/template/types";
++import type { RouteDef } from "@harness/template";
++
++import type { MappingFactsSource } from "../tools_mesh2code/mapping-facts.ts";
++import type { MappingVisionInput } from "../agents_mesh2code/mapping-vision.ts";
++import { runMappingAgent } from "../agents_mesh2code/mapping-agent.ts";
++
++export interface MappingCriticView {
++  label: string;
++  path: string;
++}
++
++/** The committed CAD state and renders reviewed by one Mapping critic call. */
++export interface MappingCriticContext {
++  cycle: number;
++  workspaceDir: string;
++  stepDir: string;
++  scad: string;
++  stlPath: string;
++  views: readonly MappingCriticView[];
++  partsColorLegend: string;
++}
++
++export interface CriticFeedback {
++  text: string;
++  actionable: boolean;
++}
++
++/** Mapping-specific data prepared from the current CAD state. */
++export interface MappingCriticInput {
++  source: MappingFactsSource;
++  semanticPlan: unknown;
++  vision: MappingVisionInput;
++}
++
++export type MappingCritic = (args: {
++  context: MappingCriticContext;
++  route: RouteDef<unknown>;
++  model: ModelRef;
++  signal?: AbortSignal;
++}) => Promise<CriticFeedback>;
++
++export type PrepareMappingCriticInput =
++  (context: MappingCriticContext) => Promise<MappingCriticInput>;
++
++/**
++ * Adapt the text-returning Mapping Agent to the direct refine critic seam.
++ * `prepare` must build input from the current cycle and must not reuse a report
++ * produced for an earlier CAD buffer.
++ */
++export function makeMappingCritic(prepare: PrepareMappingCriticInput): MappingCritic {
++  return async ({ context, route, model, signal }) => {
++    const input = await prepare(context);
++    const result = await runMappingAgent({
++      ...input,
++      route,
++      model,
++      ...(signal ? { signal } : {}),
++    });
++    const text = result.trim();
++    return { text, actionable: mappingFeedbackHasIssue(text) };
++  };
++}
++
++/** Keep the direct-refine handoff small: only a supported region can trigger a patch. */
++export function mappingFeedbackHasIssue(text: string): boolean {
++  return /^\s*STATUS:\s*ok\b/im.test(text) && /^\s*REGION\s+\d+/im.test(text);
++}
