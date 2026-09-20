@@ -9,19 +9,15 @@ import { buildMappingEvidence, resetMappingEvidenceExposure, type MappingEvidenc
 import { makeInspectMappingPartTool } from "./mapping-inspect-tool.ts";
 import { buildMappingArrowSummaries } from "./mapping-arrow-summary.ts";
 import { buildMappingVisionParts, type MappingVisionInput } from "./mapping-vision.ts";
-import { parseMappingFeedbackArtifact, type MappingFeedbackArtifact } from "./mapping-feedback-schema.ts";
-
-export interface MappingAgentResult { artifact: MappingFeedbackArtifact }
 
 const SYSTEM = [
   "You are a standalone mapping evaluator.",
   "Use semanticPlan descriptions, Blender per-part-color candidate views, aligned GT/candidate comparison views, and bounded part-level arrow summaries. Vision identifies the candidate geometry overlapping a discrepancy; arrow summaries support direction and coherent region merging; bounded mapping evidence supports the final diagnosis. GT has no part provenance, so candidatePartIds are region overlap labels, not claims that every listed part moved.",
   "Each arrow summary aggregates the candidate-to-GT residuals for one candidate part. Treat displacementMm as the correction vector to apply to the candidate: candidate → GT. Never invert its sign or replace it with an ambiguous front/back description. State repairHint with explicit axis deltas when possible. Use direction coherence to down-rank weak residuals and merge adjacent parts with the same direction. When coherence is low or directions conflict, inspect the known part before creating or expanding a region; if the bounded inspection remains incoherent or lacks visual support, do not promote it to a primary region. A displacement is not proof that the owning part moved; use bounded evidence to ground diagnosis and repairHint.",
-  "If the initial evidence is insufficient, call inspect_mapping_part with a known partId and evidenceId. Omit radiusMm/depth first to judge the default coarse parent octree region (two levels coarser than finest); use the finest depth or a smaller radius only when that coarse summary remains ambiguous. Continue inspecting known parts as needed; stop when the evidence is sufficient and return the final artifact.",
-  "Return at most two region observations. Return only JSON with this shape: {schemaVersion:5,status:\"ok\"|\"insufficient-evidence\",regions:[{candidatePartIds:string[],evidenceIds:string[],diagnosis:string,repairHint:string}]}. status is ok exactly when regions is non-empty and insufficient-evidence exactly when regions is empty.",
+  "If the initial evidence is insufficient, call inspect_mapping_part with a known partId and evidenceId. Omit radiusMm/depth first to judge the default coarse parent octree region (two levels coarser than finest); use the finest depth or a smaller radius only when that coarse summary remains ambiguous. Continue inspecting known parts as needed; stop when the evidence is sufficient and return the final text diagnosis.",
+  "Return at most two region observations as plain text. Use this structure: STATUS: ok|insufficient-evidence, then for each region write REGION N, [modules: ...], [evidence: ...], MAPPING: ..., and FIX: .... status is ok when at least one supported region exists and insufficient-evidence when no region is supported. Output only this diagnosis text with no JSON, Markdown fence, or extra preamble.",
   "If vision and mapping cannot support a region-level conclusion, return insufficient-evidence. Do not claim unsupported source-code locations, raw mesh, or pass/fail authority.",
 ].join(" ");
-const MAX_JSON_ATTEMPTS = 2;
 const client = createLLMClient({ fetch: longTimeoutFetch, maxAttempts: 1 });
 
 function parseSemanticPlan(value: unknown): JsonObject[] {
@@ -40,26 +36,6 @@ function validatePlanCoverage(partIds: Set<string>, plan: JsonObject[]): void {
   const names = new Set(plan.map((entry) => String(entry.name)));
   const missing = [...partIds].find((partId) => !names.has(partId));
   if (missing) throw Error(`mapping partId not found in plan.json: ${missing}`);
-}
-
-function validateArtifact(artifact: MappingFeedbackArtifact, evidence: MappingEvidence): MappingFeedbackArtifact {
-  for (const region of artifact.regions) {
-    for (const partId of region.candidatePartIds) {
-      if (!evidence.partIds.has(partId)) throw Error(`mapping region references unknown part: ${partId}`);
-    }
-    for (const evidenceId of region.evidenceIds) {
-      if (!evidence.exposedEvidenceIds.has(evidenceId)) throw Error(`mapping issue references evidence not supplied: ${evidenceId}`);
-      const owner = evidence.evidenceOwners.get(evidenceId);
-      if (!owner) throw Error(`mapping issue references unknown evidence: ${evidenceId}`);
-      if (!region.candidatePartIds.includes(owner)) throw Error(`mapping evidence owner ${owner} is outside region candidates`);
-    }
-  }
-  return artifact;
-}
-
-function parseArtifactResponse(text: string, evidence: MappingEvidence): MappingFeedbackArtifact {
-  const clean = text.trim().replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "");
-  return validateArtifact(parseMappingFeedbackArtifact(clean), evidence);
 }
 
 function parseToolCalls(events: LLMEvent[]): { text: string; calls: Array<{ id: string; name: string; input: JsonObject }> } {
@@ -130,25 +106,12 @@ async function readCells(source: MappingFactsSource): Promise<JsonObject[]> {
   return cells;
 }
 
-export async function runMappingAgent(args: { source: MappingFactsSource; semanticPlan: unknown; vision: MappingVisionInput; route: RouteDef<unknown>; model: ModelRef; signal?: AbortSignal }): Promise<MappingAgentResult> {
+export async function runMappingAgent(args: { source: MappingFactsSource; semanticPlan: unknown; vision: MappingVisionInput; route: RouteDef<unknown>; model: ModelRef; signal?: AbortSignal }): Promise<string> {
   const semanticPlan = parseSemanticPlan(args.semanticPlan);
   const evidence = buildMappingEvidence(await readCells(args.source));
   validatePlanCoverage(evidence.partIds, semanticPlan);
   const inspectTool = makeInspectMappingPartTool(evidence);
   const facts: JsonObject = { semanticPlan, partArrowSummaries: buildMappingArrowSummaries(evidence) };
   const visionParts = await buildMappingVisionParts(args.vision);
-  let lastParseError: Error | undefined;
-  for (let attempt = 1; attempt <= MAX_JSON_ATTEMPTS; attempt++) {
-    const system = attempt === 1
-      ? SYSTEM
-      : `${SYSTEM}\n\nYour previous response failed local JSON validation: ${lastParseError?.message ?? "invalid JSON"}. Return a complete replacement artifact now. Output only valid JSON with no Markdown fence, prose, or extra fields.`;
-    const response = await generateMappingResponse({ route: args.route, model: args.model, system, facts, visionParts, evidence, inspectTool, signal: args.signal });
-    try {
-      return { artifact: parseArtifactResponse(response, evidence) };
-    } catch (error) {
-      lastParseError = error instanceof Error ? error : Error(String(error));
-      if (attempt === MAX_JSON_ATTEMPTS) throw lastParseError;
-    }
-  }
-  throw lastParseError ?? Error("mapping response was not parsed");
+  return generateMappingResponse({ route: args.route, model: args.model, system: SYSTEM, facts, visionParts, evidence, inspectTool, signal: args.signal });
 }

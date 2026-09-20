@@ -33,6 +33,7 @@ import { runDraft, type DraftResult } from "./draft.ts";
 import { runIncrementalDraft, type IncrementalDraftResult } from "./draft-incremental.ts";
 import { runRefine, type RefineResult } from "./refine.ts";
 import { runDirectRefine } from "./refine-direct.ts";
+import type { MappingCritic } from "./mapping-critic.ts";
 import { runPaint, type PaintResult } from "./paint.ts";
 import { runMotionExport, type MotionExportResult } from "./motion.ts";
 import type { MotionCollisionApproximation } from "../motion/types.ts";
@@ -124,6 +125,8 @@ export interface RunProceduraOpts {
    * the final model: draft.{scad,stl,obj} are promoted to final.* and a
    * synthetic verdict="skipped" RefineResult is returned (no refine loop). */
   refine?: boolean;
+  /** Optional Mapping critic for each direct-refine cycle. */
+  mappingCritic?: MappingCritic;
   /** Persist the binary STL deliverable (draft.stl / final.stl) alongside the
    * OBJ. Default false — only the normalized OBJ (+ SCAD) is exported; STL is
    * kept in internal build dirs for connectivity/rendering. */
@@ -377,6 +380,7 @@ export async function runProcedura(opts: RunProceduraOpts): Promise<RunProcedura
         : await runDirectRefine({
             ...refineOpts,
             ...(opts.externalExecution?.inputImages !== undefined ? { referenceImages: opts.externalExecution.inputImages } : {}),
+            ...(opts.mappingCritic !== undefined ? { mappingCritic: opts.mappingCritic } : {}),
           });
     }
 

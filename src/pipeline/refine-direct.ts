@@ -21,7 +21,8 @@
  *
  * So the sequence is code now, and the model does the two things that actually
  * need judgement: **what is wrong** (critic) and **what the corrected code is**
- * (patch). Two LLM calls per cycle, no tools, no transcript growth across
+ * (patch). The default cycle has two LLM calls; an opted-in Mapping critic adds
+ * one parallel evaluator call. There are no tools or transcript growth across
  * cycles — each patch call is fresh, so a long refine can't blow the window.
  *
  * ## The cycle
@@ -59,6 +60,7 @@ import { parsePatchResponse, applyPatch } from "./refine-patch.ts";
 import { writeFinalOutputs, DEFAULT_REFINE_STEPS } from "./refine.ts";
 import type { RefineOpts, RefineResult } from "./refine.ts";
 import { timeStage } from "./stage-timer.ts";
+import type { CriticFeedback, MappingCritic } from "./mapping-critic.ts";
 
 const DIAGNOSE_PROMPT_PATH = new URL("./diagnose-prompt.md", import.meta.url).pathname;
 const PATCH_PROMPT_PATH = new URL("./refine-patch-prompt.md", import.meta.url).pathname;
@@ -240,6 +242,8 @@ async function measureModules(
 export interface DirectRefineOpts extends RefineOpts {
   /** Explicit ordered references supplied by the unified pipeline. */
   referenceImages?: readonly { label: string; path: string }[];
+  /** Optional Mapping critic using the same committed CAD state as visual critic. */
+  mappingCritic?: MappingCritic;
 }
 
 export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineResult> {
@@ -293,15 +297,8 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
   log(`  refine-steps:  ${state.refineStepsDir}`);
   log(``);
 
-  // The STL for the CURRENT buffer, or null when it needs (re)building.
-  //
-  // Deliberately not state.latestStlPath: that field is pre-seeded with
-  // draft.stl, which is a LAZY-UNION export. Overlapping solids are left
-  // unmerged there, so its facet count is not comparable to a normal compile's
-  // — using it as the regression baseline would make the very first patch look
-  // like it destroyed detail and get it thrown away. Starting at null forces
-  // one honest compile before the first comparison, and every later cycle
-  // reuses the STL the patch verification already produced.
+  // The STL for the CURRENT buffer. It is rebuilt at the start of every cycle
+  // so both critics always review the same freshly compiled geometry.
   let builtStl: string | null = null;
   /** Consecutive cycles that accepted nothing. */
   let barren = 0;
@@ -318,26 +315,18 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
     log(`--- cycle ${cycle}/${maxCycles} ---`);
 
     // ── 1. Compile + render. Not a decision: it happens every cycle. ──────
-    // The compile is only needed for the facet baseline (connectivity does its
-    // own union-wrapped compile, and the renderer works from the source), so
-    // skip it when the buffer is already built: after an accepted patch we
-    // compiled that exact buffer to verify it, and after a rejected cycle the
-    // buffer never changed. That is one full compile per cycle saved on a model
-    // whose STL runs to tens of megabytes.
     const compileDir = join(state.agentCompilesDir, `cycle_${pad(cycle)}`);
-    if (builtStl === null) {
-      mkdirSync(compileDir, { recursive: true });
-      try {
-        const r = await timeStage("openscad.refine", () => compileScad(state.scad, { outputDir: compileDir }));
-        builtStl = r.stlPath;
-        state.latestStlPath = r.stlPath;
-        state.stlIsStale = false;
-      } catch (e) {
-        // The buffer we were handed does not build. Nothing downstream helps.
-        log(`  compile failed on entry: ${(e as Error).message.slice(0, 200)}`);
-        verdict = "error";
-        break;
-      }
+    mkdirSync(compileDir, { recursive: true });
+    try {
+      const r = await timeStage("openscad.refine", () => compileScad(state.scad, { outputDir: compileDir }));
+      builtStl = r.stlPath;
+      state.latestStlPath = r.stlPath;
+      state.stlIsStale = false;
+    } catch (e) {
+      // The current buffer does not build. Nothing downstream helps.
+      log(`  compile failed on entry: ${(e as Error).message.slice(0, 200)}`);
+      verdict = "error";
+      break;
     }
 
     const viewsDir = join(stepDir, "views");
@@ -358,7 +347,7 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
     state.latestViewsScad = state.scad;
     await ensureConnectivity(state);
 
-    // ── 2. Critic. ────────────────────────────────────────────────────────
+    // ── 2. Critics. Both review the same compiled/rendered CAD state. ─────
     const criticParts: CanonicalPart[] = [
       { kind: "text", text: buildDiagnoseLeadText(state, { fixerHasTools: false }) },
       ...referenceParts,
@@ -373,28 +362,62 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
         "Return ONLY the diagnosis block in the format your system prompt specifies.",
     });
 
+    const mappingContext = {
+      cycle,
+      workspaceDir: workspace.rootDir,
+      stepDir,
+      scad: state.scad,
+      stlPath: builtStl!,
+      views: state.latestViews,
+      partsColorLegend: state.partsColorLegend,
+    };
+
+    const visualPromise = timeStage("llm.critic", () => generateWithRetry({
+      route, model, system: criticSystem, parts: criticParts,
+      label: `critic c${cycle}`, ...(opts.signal ? { signal: opts.signal } : {}),
+    }));
+    const mappingPromise = opts.mappingCritic
+      ? timeStage("llm.mapping-critic", () => opts.mappingCritic!({
+          context: mappingContext,
+          route,
+          model,
+          ...(opts.signal ? { signal: opts.signal } : {}),
+        }))
+      : Promise.resolve(null);
+
     let diagnosis: string;
+    let visualFeedback: CriticFeedback;
+    let mappingFeedback: CriticFeedback | null;
     try {
-      const r = await timeStage("llm.critic", () => generateWithRetry({
-        route, model, system: criticSystem, parts: criticParts,
-        label: `critic c${cycle}`, ...(opts.signal ? { signal: opts.signal } : {}),
-      }));
-      llmCalls += 1;
-      diagnosis = r.text.trim();
+      const [visualResult, mappingResult] = await Promise.all([visualPromise, mappingPromise]);
+      llmCalls += opts.mappingCritic ? 2 : 1;
+      visualFeedback = {
+        text: visualResult.text.trim(),
+        actionable: hasHighIssue(visualResult.text),
+      };
+      mappingFeedback = mappingResult;
+      const mappingDiagnosis = mappingFeedback?.text.trim() ?? "";
+      diagnosis = mappingDiagnosis
+        ? "=== VISUAL CRITIC ===\n" + visualFeedback.text + "\n\n=== MAPPING CRITIC ===\n" + mappingDiagnosis
+        : visualFeedback.text;
       writeFileSync(join(stepDir, "diagnosis.txt"), diagnosis, "utf8");
-      if (r.reasoning) writeFileSync(join(stepDir, "diagnose_thinking.txt"), r.reasoning, "utf8");
+      if (visualResult.reasoning) writeFileSync(join(stepDir, "diagnose_thinking.txt"), visualResult.reasoning, "utf8");
+      if (mappingDiagnosis) writeFileSync(join(stepDir, "mapping.txt"), mappingDiagnosis, "utf8");
     } catch (e) {
       log(`  critic failed: ${(e as Error).message.slice(0, 200)} — ending refine`);
       break;
     }
 
-    const summaryLine = diagnosis.split("\n").find((l) => /^\s*summary:/i.test(l)) ?? diagnosis.slice(0, 120);
+    const visualDiagnosis = visualFeedback.text;
+    const mappingDiagnosis = mappingFeedback?.text.trim() ?? "";
+
+    const summaryLine = visualDiagnosis.split("\n").find((l) => /^\s*summary:/i.test(l)) ?? visualDiagnosis.slice(0, 120);
     summary = summaryLine.replace(/^\s*summary:\s*/i, "").trim();
     state.diagnosisHistory.push({ cycle, summary, raw: diagnosis });
     log(`  critic: ${summary.slice(0, 160)}`);
 
-    if (!hasHighIssue(diagnosis)) {
-      log(`  no HIGH issues remain — finishing`);
+    if (!visualFeedback.actionable && !(mappingFeedback?.actionable ?? false)) {
+      log(`  no actionable critic issues remain — finishing`);
       verdict = "ok";
       break;
     }
@@ -435,7 +458,7 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
               : "") +
             (workspace.hasImage
               ? "The reference image and the current build views follow, then the full "
-              : "The target specification and the current build views follow, then the full ") + +
+              : "The target specification and the current build views follow, then the full ") +
             "SCAD source, then the reviewer's diagnosis.",
         },
         ...referenceParts,
@@ -459,7 +482,9 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
         kind: "text",
         text:
           (repairNote ? `=== YOUR PREVIOUS ATTEMPT FAILED — FIX IT ===\n${repairNote}\n\n` : "") +
-          "Fix the highest-severity issue. Emit only the patch blocks.",
+          (mappingDiagnosis
+            ? "Consider both critic feedback blocks together. Fix the highest-severity supported issue and emit only the patch blocks."
+            : "Fix the highest-severity issue. Emit only the patch blocks."),
       });
 
       let raw: string;

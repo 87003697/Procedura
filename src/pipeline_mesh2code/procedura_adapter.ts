@@ -1,4 +1,5 @@
 import { runProcedura, type RunProceduraResult } from "../pipeline/procedura.ts";
+import type { MappingCritic } from "../pipeline/mapping-critic.ts";
 
 /** Inputs owned by the Mesh-to-CAD host when invoking the Procedura pipeline. */
 export interface MeshToCadProceduraOpts {
@@ -7,6 +8,7 @@ export interface MeshToCadProceduraOpts {
   planText: string;
   referenceImages: readonly { label: string; path: string }[];
   refine: boolean;
+  mappingCritic?: MappingCritic;
 }
 
 /**
@@ -34,5 +36,6 @@ export function runMeshToCadProcedura(
       draftPromotion: "open-loop",
     },
     refine: opts.refine,
+    ...(opts.mappingCritic !== undefined ? { mappingCritic: opts.mappingCritic } : {}),
   });
 }
