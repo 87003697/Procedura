@@ -6,6 +6,7 @@ import {
   type PlanReferenceRunResult,
 } from "./mesh-to-cad-plan.ts";
 import { runMeshToCadProcedura } from "./procedura_adapter.ts";
+import type { MappingCritic } from "../pipeline/mapping-critic.ts";
 import type { ViewName } from "../render/views.ts";
 
 const PROCEDURA_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..", "..");
@@ -29,9 +30,9 @@ function isInside(path: string, root: string): boolean {
 }
 
 export async function runMeshToCadGeneration(
-  opts: PlanReferenceRunOpts & { refine?: boolean },
+  opts: PlanReferenceRunOpts & { refine?: boolean; mappingCritic?: MappingCritic },
 ): Promise<PlanReferenceRunResult> {
-  const { refine = false, ...planOpts } = opts;
+  const { refine = false, mappingCritic, ...planOpts } = opts;
   const outputDir = resolve(opts.outputDir);
   if (existsSync(outputDir) && !statSync(outputDir).isDirectory()) {
     throw new Error("outputDir must be a directory");
@@ -65,6 +66,7 @@ export async function runMeshToCadGeneration(
       path: image.path,
     })),
     refine,
+    ...(mappingCritic !== undefined ? { mappingCritic } : {}),
   });
   const finalScad = resolve(outputDir, "final.scad");
   const finalObj = resolve(outputDir, "final.obj");

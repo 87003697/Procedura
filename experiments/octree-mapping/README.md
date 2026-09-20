@@ -113,3 +113,33 @@ mixed provenance below input max depth, and a bounded depth-8 case.
 It also covers normal and occupancy-neighborhood geometric disambiguation.
 Each successful case also checks the exact compact field sets, complete solved-depth
 coverage, array counts, derivable parent prefixes, and millimetre displacement vectors.
+
+## Mapping critic in direct refine
+
+The direct refine loop can accept an optional `MappingCritic` with the same outer
+shape as the visual critic: it receives the current cycle's SCAD, compiled STL,
+parts-colour views, legend, and step directory, then returns one Mapping text
+feedback string. The host adapter is responsible for preparing the current
+candidate/target octree `input` and `report`, the existing `plan.json` semantic
+plan, and the front/top/right candidate/comparison images required by
+`runMappingAgent`.
+
+```ts
+import { makeMappingCritic } from "../../src/pipeline/mapping-critic.ts";
+
+const mappingCritic = makeMappingCritic(async (context) => {
+  const current = await prepareCurrentMappingInput(context);
+  return {
+    source: current.source,
+    semanticPlan: current.semanticPlan,
+    vision: current.vision,
+  };
+});
+```
+
+Pass that callback through the Mesh-to-CAD host or `runProcedura`. Each cycle must
+prepare the Mapping source from the `context.stlPath` for that cycle. The Mapping
+Agent returns the plain-text diagnosis consumed by refine; its input schema,
+bounded facts, plan coverage, and optional inspection-tool argument checks remain
+inside the Mapping path. The refine path does not parse a Mapping JSON artifact.
+Without a Mapping critic, ordinary visual direct refine is unchanged.
