@@ -40,19 +40,28 @@ Walk every visible discrepancy between the **current renders** and the **referen
 
 # OUTPUT FORMAT
 
-Return your response in this exact format, no markdown fences, no preamble:
+Return your response in this exact format, no markdown fences, no preamble. Order
+issues from most important to least important. Give each issue a short stable
+snake_case name that can be referenced in a later cycle; do not put severity in
+the name.
 
 ```
 SUMMARY: <one-line verdict — e.g. "3 high-severity issues: wrong arm count, missing gimbal, lens proportion drift">
 
 ISSUES:
-1. [HIGH] [modules: <name1>, <name2>] <one-sentence problem statement using measurements from the ortho views>. FIX: <one-sentence direction — parameter to change, module to add/remove/move, etc.>
-2. [HIGH|MED|LOW] [modules: ...] ...
+1. <issue_name> [HIGH] [modules: <name1>, <name2>]
+   PROBLEM: <one-sentence problem statement using measurements from the ortho views>.
+   EVIDENCE: <the visible or measured evidence supporting the problem>.
+   FIX: <one-sentence direction — parameter to change, module to add/remove/move, etc.>
+2. <issue_name> [MED] [modules: ...]
+   PROBLEM: ...
+   EVIDENCE: ...
+   FIX: ...
 3. ...
 ```
 
 If there are no issues, write `ISSUES: (none — current build matches the reference within tolerance)`.
 
-Use `[HIGH]` for missing major parts, floaters, structural count errors, wrong placement, a major part mounted backwards/upside-down, and >25% proportion errors. Use `[MED]` for lesser orientation issues and 10-25% proportion drift on prominent parts. Use `[LOW]` for minor polish and cosmetic repeated-feature counts.
+Use `[HIGH]` for missing major parts, floaters, structural count errors, wrong placement, a major part mounted backwards/upside-down, and >25% proportion errors. Use `[MED]` for lesser orientation issues and 10-25% proportion drift on prominent parts. Use `[LOW]` for minor polish and cosmetic repeated-feature counts. Severity remains a review label; issue order is the repair priority.
 
 Be exhaustive but precise — the engineer who fixes this only sees your diagnosis + the SCAD code, so name every module that needs to change.

@@ -1,0 +1,549 @@
+diff --git a/experiments/octree-mapping/README.md b/experiments/octree-mapping/README.md
+index a030868f06eff041f45c36d19063243342f2217a..1a771a6301ebd510b20a763fb3d72c11b8779f27 100644
+--- a/experiments/octree-mapping/README.md
++++ b/experiments/octree-mapping/README.md
+@@ -139,7 +139,10 @@ const mappingCritic = makeMappingCritic(async (context) => {
+ 
+ Pass that callback through the Mesh-to-CAD host or `runProcedura`. Each cycle must
+ prepare the Mapping source from the `context.stlPath` for that cycle. The Mapping
+-Agent returns the plain-text diagnosis consumed by refine; its input schema,
+-bounded facts, plan coverage, and optional inspection-tool argument checks remain
+-inside the Mapping path. The refine path does not parse a Mapping JSON artifact.
+-Without a Mapping critic, ordinary visual direct refine is unchanged.
++Agent returns the same plain-text diagnosis shape as the visual critic:
++`SUMMARY`, `ISSUES`, a severity tag, `[modules: ...]`, and a `FIX:` direction.
++The Mapping issue keeps its evidence-grounded candidate→GT axis correction inside
++the problem and fix text. Its input schema, bounded facts, plan coverage, and
++optional inspection-tool argument checks remain inside the Mapping path. The
++refine path does not parse a Mapping JSON artifact. Without a Mapping critic,
++ordinary visual direct refine is unchanged.
+diff --git a/src/agents_mesh2code/mapping-agent.ts b/src/agents_mesh2code/mapping-agent.ts
+index d775eaa40664ceb2689251ea1a2badd3413d0dcc..3814448c1b5c7cad775f6e166dc516dd6b304a48 100644
+--- a/src/agents_mesh2code/mapping-agent.ts
++++ b/src/agents_mesh2code/mapping-agent.ts
+@@ -7,16 +7,19 @@ import { splitThinkTags } from "../llm/think-tags.ts";
+ import { makeMappingFactsTool, type MappingFactsSource } from "../tools_mesh2code/mapping-facts.ts";
+ import { buildMappingEvidence, resetMappingEvidenceExposure, type MappingEvidence } from "./mapping-evidence.ts";
+ import { makeInspectMappingPartTool } from "./mapping-inspect-tool.ts";
+-import { buildMappingArrowSummaries } from "./mapping-arrow-summary.ts";
+ import { buildMappingVisionParts, type MappingVisionInput } from "./mapping-vision.ts";
++import type { GenerateResult } from "../llm/generate.ts";
+ 
+ const SYSTEM = [
+   "You are a standalone mapping evaluator.",
+-  "Use semanticPlan descriptions, Blender per-part-color candidate views, aligned GT/candidate comparison views, and bounded part-level arrow summaries. Vision identifies the candidate geometry overlapping a discrepancy; arrow summaries support direction and coherent region merging; bounded mapping evidence supports the final diagnosis. GT has no part provenance, so candidatePartIds are region overlap labels, not claims that every listed part moved.",
+-  "Each arrow summary aggregates the candidate-to-GT residuals for one candidate part. Treat displacementMm as the correction vector to apply to the candidate: candidate → GT. Never invert its sign or replace it with an ambiguous front/back description. State repairHint with explicit axis deltas when possible. Use direction coherence to down-rank weak residuals and merge adjacent parts with the same direction. When coherence is low or directions conflict, inspect the known part before creating or expanding a region; if the bounded inspection remains incoherent or lacks visual support, do not promote it to a primary region. A displacement is not proof that the owning part moved; use bounded evidence to ground diagnosis and repairHint.",
++  "Use the complete visual-critic context, semanticPlan descriptions, aligned GT/candidate comparison views, and the bounded per-part cell evidence. The visual context contains the target views, current candidate views, and complete current SCAD source; use it to connect a geometric discrepancy to the actual module and placement expressions. GT has no part provenance, so candidate part ids are region-overlap labels, not claims that every listed part moved.",
++  "Treat displacementMm as the correction vector in the mapping frame, candidate → GT. Never invert its sign or replace it with an ambiguous front/back description. The initial facts contain representative cell locations and vectors; preserve their spatial pattern instead of replacing it with a single module-average arrow. A displacement is not proof that the owning part moved: use coherent evidence and the SCAD source before naming a shared parameter or placement expression.",
++  "Before writing each issue, classify the supported source-level cause as one of: local-module geometry, shared parameter, parent placement, cumulative downstream placement, or unresolved. If residual magnitude or direction changes progressively along a connected module sequence and the SCAD source shows downstream placements depending on a common angle, length, datum, or ancestor expression, classify it as cumulative downstream placement. In that case identify the shared parameter or placement expression that should be changed and describe one structural repair strategy. The per-cell vectors are evidence for that strategy, not a list of independent edits.",
++  "Do not fit or assume a rigid translation, rotation, affine transform, or cumulative-drift model as the repair. A cumulative downstream placement diagnosis is allowed only when the observed spatial pattern and SCAD dependency support it. Do not recommend independent translate() compensation for every affected module when a shared source expression explains the pattern. If no shared source construct is supported, state the affected region and leave the source-level cause unresolved.",
++  "Mapping-frame displacement values are not automatically raw SCAD coordinates. Do not copy them into a PLACE block or present them as direct per-module patch values unless the visual context or mapping facts provide the conversion and the source-level cause is local. For shared or cumulative errors, report the range and trend as evidence, then prioritize the shared angle, length, datum, or parent placement instead of emitting one translate correction per module.",
+   "If the initial evidence is insufficient, call inspect_mapping_part with a known partId and evidenceId. Omit radiusMm/depth first to judge the default coarse parent octree region (two levels coarser than finest); use the finest depth or a smaller radius only when that coarse summary remains ambiguous. Continue inspecting known parts as needed; stop when the evidence is sufficient and return the final text diagnosis.",
+-  "Return at most two region observations as plain text. Use this structure: STATUS: ok|insufficient-evidence, then for each region write REGION N, [modules: ...], [evidence: ...], MAPPING: ..., and FIX: .... status is ok when at least one supported region exists and insufficient-evidence when no region is supported. Output only this diagnosis text with no JSON, Markdown fence, or extra preamble.",
+-  "If vision and mapping cannot support a region-level conclusion, return insufficient-evidence. Do not claim unsupported source-code locations, raw mesh, or pass/fail authority.",
++  "Return at most two supported mapping issues as plain text using the same diagnosis format as the visual critic. Order issues from most important to least important and give each a short stable snake_case name. Use: SUMMARY: <one-line verdict>, then ISSUES:, then numbered entries of the form `1. <issue_name> [HIGH|MED|LOW] [modules: ...] PROBLEM: <concrete mapped discrepancy>. EVIDENCE: <supported evidence>. CAUSE: <local-module|shared-parameter|parent-placement|cumulative-downstream-placement|unresolved>. TARGET: <exact supported SCAD parameter, placement expression, or module dependency to inspect/change; use unresolved when the source does not support a name>. CONSTRAINTS: <must-preserve or must-avoid condition, or none>. FIX: <candidate→GT direction and affected region; for shared or cumulative errors describe the trend/range, not independent per-module translate values>.` If no region is supported, return `SUMMARY: no supported mapping issue` followed by `ISSUES: (none — mapping evidence is insufficient for a grounded region-level correction)`. Output only this diagnosis text with no JSON, Markdown fence, STATUS/REGION wrapper, or extra preamble.",
++  "Use [HIGH] for a supported wrong placement, wrong orientation, or disconnected region that materially affects the model; use [MED] for a smaller but actionable localized residual; use [LOW] only for a minor residual that should not drive a repair by itself. Severity labels the issue, while issue order determines repair priority. Every issue must name the candidate module(s) from the semantic plan and preserve the candidate→GT sign convention in FIX. Do not claim unsupported source-code locations, raw mesh, or pass/fail authority. Do not name a shared parameter unless the complete SCAD source visibly supports that dependency.",
+ ].join(" ");
+ const client = createLLMClient({ fetch: longTimeoutFetch, maxAttempts: 1 });
+ 
+@@ -38,8 +41,9 @@ function validatePlanCoverage(partIds: Set<string>, plan: JsonObject[]): void {
+   if (missing) throw Error(`mapping partId not found in plan.json: ${missing}`);
+ }
+ 
+-function parseToolCalls(events: LLMEvent[]): { text: string; calls: Array<{ id: string; name: string; input: JsonObject }> } {
++function parseToolCalls(events: LLMEvent[]): { text: string; reasoning: string; calls: Array<{ id: string; name: string; input: JsonObject }> } {
+   const text = events.filter((event) => event.kind === "text-delta").map((event) => event.text).join("");
++  const reasoning = events.filter((event) => event.kind === "thinking-delta").map((event) => event.text).join("");
+   const pending = new Map<string, { name: string; args: string; input?: JsonObject }>();
+   for (const event of events) {
+     if (event.kind === "tool-call-start") pending.set(event.toolCallId, { name: event.toolName, args: "" });
+@@ -48,6 +52,7 @@ function parseToolCalls(events: LLMEvent[]): { text: string; calls: Array<{ id:
+   }
+   return {
+     text,
++    reasoning,
+     calls: [...pending].map(([id, call]) => ({
+       id,
+       name: call.name,
+@@ -56,9 +61,10 @@ function parseToolCalls(events: LLMEvent[]): { text: string; calls: Array<{ id:
+   };
+ }
+ 
+-async function generateMappingResponse(args: { route: RouteDef<unknown>; model: ModelRef; system: string; facts: JsonObject; visionParts: CanonicalPart[]; evidence: MappingEvidence; inspectTool: ReturnType<typeof makeInspectMappingPartTool>; signal?: AbortSignal }): Promise<string> {
++async function generateMappingResponse(args: { route: RouteDef<unknown>; model: ModelRef; system: string; facts: JsonObject; visionParts: CanonicalPart[]; evidence: MappingEvidence; inspectTool: ReturnType<typeof makeInspectMappingPartTool>; signal?: AbortSignal }): Promise<GenerateResult> {
+   resetMappingEvidenceExposure(args.evidence);
+   let messages: CanonicalMessage[] = [{ role: "user", content: [{ kind: "text", text: JSON.stringify(args.facts) }, ...args.visionParts] }];
++  let reasoning = "";
+   for (;;) {
+     const request: CanonicalRequest = {
+       model: args.model,
+@@ -71,7 +77,14 @@ async function generateMappingResponse(args: { route: RouteDef<unknown>; model:
+     applyAutoCache(request, { protocolId: args.route.protocol.id });
+     const events = await client.generate(args.route, request);
+     const parsed = parseToolCalls(events);
+-    if (parsed.calls.length === 0) return splitThinkTags(parsed.text).text;
++    reasoning += parsed.reasoning;
++    if (parsed.calls.length === 0) {
++      const split = splitThinkTags(parsed.text);
++      return {
++        text: split.text,
++        reasoning: reasoning + (split.think ? (reasoning ? "\n\n" : "") + split.think : ""),
++      };
++    }
+     const assistantParts: CanonicalPart[] = [];
+     if (parsed.text) assistantParts.push({ kind: "text", text: parsed.text });
+     for (const call of parsed.calls) assistantParts.push({ kind: "tool-call", toolCallId: call.id, toolName: call.name, input: call.input });
+@@ -106,12 +119,17 @@ async function readCells(source: MappingFactsSource): Promise<JsonObject[]> {
+   return cells;
+ }
+ 
+-export async function runMappingAgent(args: { source: MappingFactsSource; semanticPlan: unknown; vision: MappingVisionInput; route: RouteDef<unknown>; model: ModelRef; signal?: AbortSignal }): Promise<string> {
++export async function runMappingAgent(args: { source: MappingFactsSource; semanticPlan: unknown; vision: MappingVisionInput; route: RouteDef<unknown>; model: ModelRef; signal?: AbortSignal }): Promise<GenerateResult> {
+   const semanticPlan = parseSemanticPlan(args.semanticPlan);
+   const evidence = buildMappingEvidence(await readCells(args.source));
+   validatePlanCoverage(evidence.partIds, semanticPlan);
+   const inspectTool = makeInspectMappingPartTool(evidence);
+-  const facts: JsonObject = { semanticPlan, partArrowSummaries: buildMappingArrowSummaries(evidence) };
++  const input = args.source.input as JsonObject;
++  const facts: JsonObject = {
++    mappingFrame: input.frame ?? null,
++    semanticPlan,
++    partEvidence: evidence.parts,
++  };
+   const visionParts = await buildMappingVisionParts(args.vision);
+   return generateMappingResponse({ route: args.route, model: args.model, system: SYSTEM, facts, visionParts, evidence, inspectTool, signal: args.signal });
+ }
+diff --git a/src/agents_mesh2code/mapping-arrow-summary.ts b/src/agents_mesh2code/mapping-arrow-summary.ts
+index 0bf47e2069b3d4c3d8d6bb7bb7eae37208945d9b..2f687b518452ba000c7f6da9b2c340f91d525f0d 100644
+--- a/src/agents_mesh2code/mapping-arrow-summary.ts
++++ b/src/agents_mesh2code/mapping-arrow-summary.ts
+@@ -43,9 +43,3 @@ export function summarizeMappingArrows(partId: string, cells: JsonObject[], evid
+     directionCoherence: length(unit) / totalWeight,
+   };
+ }
+-
+-export function buildMappingArrowSummaries(evidence: MappingEvidence): JsonObject[] {
+-  return [...evidence.cellsByPart.entries()]
+-    .map(([partId, cells]) => summarizeMappingArrows(partId, cells, evidence))
+-    .filter((summary): summary is JsonObject => summary !== undefined);
+-}
+diff --git a/src/agents_mesh2code/mapping-evidence.ts b/src/agents_mesh2code/mapping-evidence.ts
+index 1e9fbd3f9e61a5c5a345406cb14ba15e845eeee1..390ffc83b5e67efbea8115a6ff9fc5ace436e234 100644
+--- a/src/agents_mesh2code/mapping-evidence.ts
++++ b/src/agents_mesh2code/mapping-evidence.ts
+@@ -90,7 +90,7 @@ export function buildMappingEvidence(cells: JsonObject[]): MappingEvidence {
+   const parts = [...cellsByPart].map(([partId, partCells]) => {
+     const evidence = selectEvidence(partId, partCells).map((candidate) => candidate.value);
+     for (const item of evidence) initialEvidenceIds.add(String(item.id));
+-    return { partId, evidence } as JsonObject;
++    return { partId, cellCount: partCells.length, evidence } as JsonObject;
+   });
+   for (const [partId, partCells] of cellsByPart) {
+     for (const cell of partCells) evidenceOwners.set(`${partId}:${cell.depth}:${cell.prefix}`, partId);
+diff --git a/src/agents_mesh2code/mapping-vision.ts b/src/agents_mesh2code/mapping-vision.ts
+index 61f4388a3969d774b93473da74d0ea05f12df564..140911acaecde9b4a1cfe17cb8481bc377324dcd 100644
+--- a/src/agents_mesh2code/mapping-vision.ts
++++ b/src/agents_mesh2code/mapping-vision.ts
+@@ -12,6 +12,8 @@ export interface MappingVisionView {
+ export interface MappingVisionInput {
+   legend: string;
+   views: readonly MappingVisionView[];
++  /** The same multimodal critic input used by direct refine. */
++  criticParts?: readonly CanonicalPart[];
+ }
+ 
+ const VIEW_ORDER: readonly MappingVisionViewName[] = ["front", "top", "right"];
+@@ -21,13 +23,18 @@ export async function buildMappingVisionParts(input: MappingVisionInput): Promis
+   if (input.views.length !== VIEW_ORDER.length) throw Error("mapping vision requires front, top, and right views");
+   const views = [...input.views].sort((a, b) => VIEW_ORDER.indexOf(a.name) - VIEW_ORDER.indexOf(b.name));
+   if (views.some((view, index) => view.name !== VIEW_ORDER[index])) throw Error("mapping vision views must be unique front, top, and right");
+-  const parts: CanonicalPart[] = [{
+-    kind: "text",
+-    text: "VISION INPUT: Blender per-part-color candidate render plus aligned GT/candidate comparison. Candidate colors identify overlapping candidate geometry; comparison views show visible discrepancy. This is identity and silhouette evidence, not millimetre measurement. Part-color legend:\n" + input.legend,
+-  }];
++  const parts: CanonicalPart[] = [
++    ...(input.criticParts ?? []),
++    {
++      kind: "text",
++      text: "MAPPING-SPECIFIC INPUT: aligned GT/candidate comparison views and candidate-part provenance. Candidate colors identify overlapping candidate geometry; comparison views show visible discrepancy. This is identity and silhouette evidence, not millimetre measurement. Part-color legend:\n" + input.legend,
++    },
++  ];
+   for (const view of views) {
+-    parts.push({ kind: "text", text: `Blender per-part-color candidate view: ${view.name}` });
+-    parts.push({ kind: "image", data: (await readFile(view.partColorPath)).toString("base64"), mimeType: "image/png" });
++    if (!input.criticParts?.length) {
++      parts.push({ kind: "text", text: `Blender per-part-color candidate view: ${view.name}` });
++      parts.push({ kind: "image", data: (await readFile(view.partColorPath)).toString("base64"), mimeType: "image/png" });
++    }
+     parts.push({ kind: "text", text: `Aligned GT/candidate comparison view: ${view.name}` });
+     parts.push({ kind: "image", data: (await readFile(view.comparisonPath)).toString("base64"), mimeType: "image/png" });
+   }
+diff --git a/src/pipeline/diagnose-prompt.md b/src/pipeline/diagnose-prompt.md
+index debb8108339c03afe95c7e8c611455895e1b3133..f8b2402068b7d64c29db1bb9db5827226a2d20db 100644
+--- a/src/pipeline/diagnose-prompt.md
++++ b/src/pipeline/diagnose-prompt.md
+@@ -40,19 +40,28 @@ Walk every visible discrepancy between the **current renders** and the **referen
+ 
+ # OUTPUT FORMAT
+ 
+-Return your response in this exact format, no markdown fences, no preamble:
++Return your response in this exact format, no markdown fences, no preamble. Order
++issues from most important to least important. Give each issue a short stable
++snake_case name that can be referenced in a later cycle; do not put severity in
++the name.
+ 
+ ```
+ SUMMARY: <one-line verdict — e.g. "3 high-severity issues: wrong arm count, missing gimbal, lens proportion drift">
+ 
+ ISSUES:
+-1. [HIGH] [modules: <name1>, <name2>] <one-sentence problem statement using measurements from the ortho views>. FIX: <one-sentence direction — parameter to change, module to add/remove/move, etc.>
+-2. [HIGH|MED|LOW] [modules: ...] ...
++1. <issue_name> [HIGH] [modules: <name1>, <name2>]
++   PROBLEM: <one-sentence problem statement using measurements from the ortho views>.
++   EVIDENCE: <the visible or measured evidence supporting the problem>.
++   FIX: <one-sentence direction — parameter to change, module to add/remove/move, etc.>
++2. <issue_name> [MED] [modules: ...]
++   PROBLEM: ...
++   EVIDENCE: ...
++   FIX: ...
+ 3. ...
+ ```
+ 
+ If there are no issues, write `ISSUES: (none — current build matches the reference within tolerance)`.
+ 
+-Use `[HIGH]` for missing major parts, floaters, structural count errors, wrong placement, a major part mounted backwards/upside-down, and >25% proportion errors. Use `[MED]` for lesser orientation issues and 10-25% proportion drift on prominent parts. Use `[LOW]` for minor polish and cosmetic repeated-feature counts.
++Use `[HIGH]` for missing major parts, floaters, structural count errors, wrong placement, a major part mounted backwards/upside-down, and >25% proportion errors. Use `[MED]` for lesser orientation issues and 10-25% proportion drift on prominent parts. Use `[LOW]` for minor polish and cosmetic repeated-feature counts. Severity remains a review label; issue order is the repair priority.
+ 
+ Be exhaustive but precise — the engineer who fixes this only sees your diagnosis + the SCAD code, so name every module that needs to change.
+diff --git a/src/pipeline/mapping-critic.ts b/src/pipeline/mapping-critic.ts
+index b514d1e04fa8d576f98a10deb786e0b64cb88c13..d8b6a02cb63d7d66d17b7480b235fa38acf5372c 100644
+--- a/src/pipeline/mapping-critic.ts
++++ b/src/pipeline/mapping-critic.ts
+@@ -1,8 +1,10 @@
+ import type { ModelRef } from "@harness/template/types";
++import type { CanonicalPart } from "@harness/template/llm/protocol";
+ import type { RouteDef } from "@harness/template";
+ 
+ import type { MappingFactsSource } from "../tools_mesh2code/mapping-facts.ts";
+ import type { MappingVisionInput } from "../agents_mesh2code/mapping-vision.ts";
++import type { GenerateResult } from "../llm/generate.ts";
+ import { runMappingAgent } from "../agents_mesh2code/mapping-agent.ts";
+ 
+ export interface MappingCriticView {
+@@ -21,11 +23,6 @@ export interface MappingCriticContext {
+   partsColorLegend: string;
+ }
+ 
+-export interface CriticFeedback {
+-  text: string;
+-  actionable: boolean;
+-}
+-
+ /** Mapping-specific data prepared from the current CAD state. */
+ export interface MappingCriticInput {
+   source: MappingFactsSource;
+@@ -35,10 +32,13 @@ export interface MappingCriticInput {
+ 
+ export type MappingCritic = (args: {
+   context: MappingCriticContext;
++  /** Same multimodal input supplied to the visual critic this cycle. */
++  parts: CanonicalPart[];
+   route: RouteDef<unknown>;
+   model: ModelRef;
++  label?: string;
+   signal?: AbortSignal;
+-}) => Promise<CriticFeedback>;
++}) => Promise<GenerateResult>;
+ 
+ export type PrepareMappingCriticInput =
+   (context: MappingCriticContext) => Promise<MappingCriticInput>;
+@@ -49,20 +49,21 @@ export type PrepareMappingCriticInput =
+  * produced for an earlier CAD buffer.
+  */
+ export function makeMappingCritic(prepare: PrepareMappingCriticInput): MappingCritic {
+-  return async ({ context, route, model, signal }) => {
++  return async ({ context, parts, route, model, signal }) => {
+     const input = await prepare(context);
++    const vision = {
++      ...input.vision,
++      ...(input.vision.criticParts === undefined
++        ? { criticParts: parts }
++        : {}),
++    };
+     const result = await runMappingAgent({
+       ...input,
++      vision,
+       route,
+       model,
+       ...(signal ? { signal } : {}),
+     });
+-    const text = result.trim();
+-    return { text, actionable: mappingFeedbackHasIssue(text) };
++    return { ...result, text: result.text.trim() };
+   };
+ }
+-
+-/** Keep the direct-refine handoff small: only a supported region can trigger a patch. */
+-export function mappingFeedbackHasIssue(text: string): boolean {
+-  return /^\s*STATUS:\s*ok\b/im.test(text) && /^\s*REGION\s+\d+/im.test(text);
+-}
+diff --git a/src/pipeline/refine-direct.ts b/src/pipeline/refine-direct.ts
+index 6752b8ad4d50df43c7c511f9689e42ebba88d8e7..9390da0232dbacfabd37b147c6344357a3d3f8aa 100644
+--- a/src/pipeline/refine-direct.ts
++++ b/src/pipeline/refine-direct.ts
+@@ -60,7 +60,8 @@ import { parsePatchResponse, applyPatch } from "./refine-patch.ts";
+ import { writeFinalOutputs, DEFAULT_REFINE_STEPS } from "./refine.ts";
+ import type { RefineOpts, RefineResult } from "./refine.ts";
+ import { timeStage } from "./stage-timer.ts";
+-import type { CriticFeedback, MappingCritic } from "./mapping-critic.ts";
++import type { MappingCritic } from "./mapping-critic.ts";
++import { hasDiagnosisIssues } from "./diagnosis-format.ts";
+ 
+ const DIAGNOSE_PROMPT_PATH = new URL("./diagnose-prompt.md", import.meta.url).pathname;
+ const PATCH_PROMPT_PATH = new URL("./refine-patch-prompt.md", import.meta.url).pathname;
+@@ -70,6 +71,46 @@ const REFINE_VIEWS = [
+   "front", "back", "left", "right", "top", "bottom", "isometric",
+ ] as const;
+ 
++function buildPairedViewParts(
++  references: readonly { label: string; path: string }[],
++  candidates: readonly { view: string; path: string }[],
++): CanonicalPart[] | null {
++  if (!references.length) return null;
++  const referenceLabels = new Set(references.map((reference) => reference.label));
++  const candidateLabels = new Set(candidates.map((candidate) => candidate.view));
++  const candidatesByView = new Map(candidates.map((candidate) => [candidate.view, candidate]));
++  if (
++    references.length !== REFINE_VIEWS.length ||
++    candidates.length !== REFINE_VIEWS.length ||
++    referenceLabels.size !== REFINE_VIEWS.length ||
++    candidateLabels.size !== REFINE_VIEWS.length ||
++    [...referenceLabels].some((label) => !REFINE_VIEWS.includes(label as (typeof REFINE_VIEWS)[number])) ||
++    [...candidateLabels].some((label) => !REFINE_VIEWS.includes(label as (typeof REFINE_VIEWS)[number])) ||
++    REFINE_VIEWS.some((view) => !referenceLabels.has(view) || !candidateLabels.has(view))
++  ) return null;
++
++  return references.flatMap((reference, index): CanonicalPart[] => {
++    const candidate = candidatesByView.get(reference.label)!;
++    return [
++      {
++        kind: "text",
++        text: `=== VIEW PAIR: ${reference.label}${index === 0 ? " (primary)" : ""} ===\nTARGET / GT:`,
++      },
++      {
++        kind: "image",
++        data: readFileSync(reference.path).toString("base64"),
++        mimeType: "image/png",
++      },
++      { kind: "text", text: "CURRENT / CAD parts-colour view:" },
++      {
++        kind: "image",
++        data: readFileSync(candidate.path).toString("base64"),
++        mimeType: "image/png",
++      },
++    ];
++  });
++}
++
+ const RENDER_SIZE = Number(process.env["PROCEDURA_FEEDBACK_RENDER_SIZE"] ?? "1024") || 1024;
+ /** Patch attempts per cycle: one, plus repairs when it fails to parse/compile. */
+ const PATCH_MAX_ATTEMPTS = 3;
+@@ -136,21 +177,6 @@ const FENCE = "`".repeat(3);
+ // Diagnosis parsing
+ // ──────────────────────────────────────────────────────────────────────────
+ 
+-/**
+- * Does the diagnosis list at least one HIGH issue?
+- *
+- * The reviewer prompt specifies NUMBERED issue lines —
+- * `1. [HIGH] [modules: a, b] <problem>. FIX: <direction>` — so the tag sits
+- * after an enumerator, not at the start of the line. An earlier version of this
+- * matched only a leading/bulleted tag and therefore read a diagnosis with four
+- * HIGH issues as clean, ending the refine on its first cycle having changed
+- * nothing. Accept a numbered, bulleted, or bare tag; require the tag to open
+- * the issue so prose like "no [HIGH] issues remain" cannot trip it.
+- */
+-export function hasHighIssue(diagnosis: string): boolean {
+-  return /^[ \t]*(?:\d+[.)]|[-*])?[ \t]*\[HIGH\]/im.test(diagnosis);
+-}
+-
+ /**
+  * Module names the reviewer named, in the order it named them. Matched against
+  * the buffer's real module list so a hallucinated or misspelled name is dropped
+@@ -347,15 +373,20 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
+     state.latestViewsScad = state.scad;
+     await ensureConnectivity(state);
+ 
++    const pairedParts = buildPairedViewParts(opts.referenceImages ?? [], rv.views);
++    const comparisonParts = pairedParts ?? [
++      ...referenceParts,
++      ...state.latestViews.flatMap((view): CanonicalPart[] => [
++        { kind: "text", text: `${view.label}:` },
++        { kind: "image", data: readFileSync(view.path).toString("base64"), mimeType: "image/png" },
++      ]),
++    ];
++
+     // ── 2. Critics. Both review the same compiled/rendered CAD state. ─────
+     const criticParts: CanonicalPart[] = [
+       { kind: "text", text: buildDiagnoseLeadText(state, { fixerHasTools: false }) },
+-      ...referenceParts,
++      ...comparisonParts,
+     ];
+-    for (const v of state.latestViews) {
+-      criticParts.push({ kind: "text", text: `${v.label}:` });
+-      criticParts.push({ kind: "image", data: readFileSync(v.path).toString("base64"), mimeType: "image/png" });
+-    }
+     criticParts.push({
+       kind: "text",
+       text: "=== CURRENT SCAD CODE ===\n" + FENCE + "openscad\n" + state.scad + "\n" + FENCE + "\n\n" +
+@@ -379,44 +410,44 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
+     const mappingPromise = opts.mappingCritic
+       ? timeStage("llm.mapping-critic", () => opts.mappingCritic!({
+           context: mappingContext,
++          parts: criticParts,
+           route,
+           model,
++          label: `mapping-critic c${cycle}`,
+           ...(opts.signal ? { signal: opts.signal } : {}),
+         }))
+       : Promise.resolve(null);
+ 
+     let diagnosis: string;
+-    let visualFeedback: CriticFeedback;
+-    let mappingFeedback: CriticFeedback | null;
++    let visualDiagnosis: string;
++    let mappingDiagnosis: string;
++    let visualActionable: boolean;
++    let mappingActionable: boolean;
+     try {
+       const [visualResult, mappingResult] = await Promise.all([visualPromise, mappingPromise]);
+       llmCalls += opts.mappingCritic ? 2 : 1;
+-      visualFeedback = {
+-        text: visualResult.text.trim(),
+-        actionable: hasHighIssue(visualResult.text),
+-      };
+-      mappingFeedback = mappingResult;
+-      const mappingDiagnosis = mappingFeedback?.text.trim() ?? "";
++      visualDiagnosis = visualResult.text.trim();
++      mappingDiagnosis = mappingResult?.text.trim() ?? "";
++      visualActionable = hasDiagnosisIssues(visualDiagnosis);
++      mappingActionable = hasDiagnosisIssues(mappingDiagnosis);
+       diagnosis = mappingDiagnosis
+-        ? "=== VISUAL CRITIC ===\n" + visualFeedback.text + "\n\n=== MAPPING CRITIC ===\n" + mappingDiagnosis
+-        : visualFeedback.text;
++        ? "=== VISUAL CRITIC ===\n" + visualDiagnosis + "\n\n=== MAPPING CRITIC ===\n" + mappingDiagnosis
++        : visualDiagnosis;
+       writeFileSync(join(stepDir, "diagnosis.txt"), diagnosis, "utf8");
+       if (visualResult.reasoning) writeFileSync(join(stepDir, "diagnose_thinking.txt"), visualResult.reasoning, "utf8");
++      if (mappingResult?.reasoning) writeFileSync(join(stepDir, "mapping_thinking.txt"), mappingResult.reasoning, "utf8");
+       if (mappingDiagnosis) writeFileSync(join(stepDir, "mapping.txt"), mappingDiagnosis, "utf8");
+     } catch (e) {
+       log(`  critic failed: ${(e as Error).message.slice(0, 200)} — ending refine`);
+       break;
+     }
+ 
+-    const visualDiagnosis = visualFeedback.text;
+-    const mappingDiagnosis = mappingFeedback?.text.trim() ?? "";
+-
+     const summaryLine = visualDiagnosis.split("\n").find((l) => /^\s*summary:/i.test(l)) ?? visualDiagnosis.slice(0, 120);
+     summary = summaryLine.replace(/^\s*summary:\s*/i, "").trim();
+     state.diagnosisHistory.push({ cycle, summary, raw: diagnosis });
+     log(`  critic: ${summary.slice(0, 160)}`);
+ 
+-    if (!visualFeedback.actionable && !(mappingFeedback?.actionable ?? false)) {
++    if (!visualActionable && !mappingActionable) {
+       log(`  no actionable critic issues remain — finishing`);
+       verdict = "ok";
+       break;
+diff --git a/src/pipeline/refine-patch-prompt.md b/src/pipeline/refine-patch-prompt.md
+index b9d37e534bdbbe069c7f3f24619b005be4d798ac..b9437f107a332ad31c67b8262bc92225e122308b 100644
+--- a/src/pipeline/refine-patch-prompt.md
++++ b/src/pipeline/refine-patch-prompt.md
+@@ -2,8 +2,8 @@
+ 
+ You are Procedura, an AI parametric 3D model engineer. A reviewer has just
+ inspected the current build against the reference image and returned a
+-prioritised issue list. Your job is to fix **the highest-severity issue** by
+-rewriting the parts of the OpenSCAD program that are wrong.
++prioritised issue list. Your job is to fix **the first unresolved root cause in the ordered issue list** by
++changing the smallest supported part of the OpenSCAD program.
+ 
+ You are given, every cycle, everything you need:
+ 
+@@ -53,8 +53,19 @@ translate([0, -12, 151]) turret_ring();
+ 
+ ## Rules
+ 
+-**Fix one issue per cycle.** The highest-severity one. There will be another
+-cycle; there will not be another chance to undo a scattershot patch.
++**Fix one root cause per cycle.** The issue list is ordered from most important
++to least important; severity is supporting metadata, not a substitute for that
++order. One root cause may require several related MODULE or PLACE blocks. Do not
++split one cumulative placement problem into unrelated per-module edits.
++
++**Follow the diagnosis layer.** If an issue includes `CAUSE: shared-parameter`,
++`CAUSE: parent-placement`, or `CAUSE: cumulative-downstream-placement`, first
++modify the named existing parameter or shared placement expression in `TARGET`
++when the complete SCAD source supports it. Keep downstream modules chained from
++the corrected datum. Do not add independent `translate()` compensation to
++every affected module when the diagnosis identifies a shared source expression.
++Only use independent placement compensation when the source does not provide a
++shared construct and explain that limitation in `reason`.
+ 
+ **Magnitudes come from the measurements, not from the renders.** The measured
+ bboxes are exact and the renders are not — orthographic views are tight
+@@ -73,10 +84,14 @@ faces: an OpenSCAD union of two solids that merely abut compiles to two
+ separate solids. If you move a part, move what it mounts to, or check the
+ measurements confirm it still overlaps its neighbour.
+ 
+-**Do not rename or delete top-level modules, and do not change the parameter
+-block.** You are editing an existing program, not writing a new one. Adding a
+-part is allowed — but only through `ADD` + `PLACE`, and only when the reviewer
+-says something is genuinely missing.
++**Do not rename or delete top-level modules.** You are editing an existing
++program, not writing a new one. Express a supported shared-parameter or parent-placement repair only through
++existing `MODULE` or `PLACE` blocks; do not emit a new PARAM block. If a
++ top-level parameter cannot be expressed safely through those blocks, leave the
++source-level target unresolved and explain the limitation in `reason` rather
++than rewriting unrelated code. Preserve unrelated parameters and all geometry
++features the reviewer did not flag. Adding a part is allowed — but only through
++`ADD` + `PLACE`, and only when the reviewer says something is genuinely missing.
+ 
+ **If the reviewer reports nothing worth fixing**, reply with the single word
+ `NOCHANGE` and no blocks.
+diff --git a/src/pipeline/diagnosis-format.ts b/src/pipeline/diagnosis-format.ts
+new file mode 100644
+index 0000000..4d1e6c1
+--- /dev/null
++++ b/src/pipeline/diagnosis-format.ts
+@@ -0,0 +1,30 @@
++export type DiagnosisSeverity = "HIGH" | "MED" | "LOW";
++
++export interface DiagnosisIssueHeader {
++  number: number;
++  name: string;
++  severity: DiagnosisSeverity;
++}
++
++const NAMED_ISSUE_RE = /^\s*(\d+)[.)]\s+([A-Za-z][A-Za-z0-9_-]*)\s+\[(HIGH|MED|LOW)\](?:\s+\[modules:[^\n\]]*\])?/gim;
++const LEGACY_ISSUE_RE = /^\s*(\d+)[.)]\s+\[(HIGH|MED|LOW)\](?:\s+\[modules:[^\n\]]*\])?/gim;
++
++export function parseDiagnosisIssueHeaders(text: string): DiagnosisIssueHeader[] {
++  const named: DiagnosisIssueHeader[] = [];
++  NAMED_ISSUE_RE.lastIndex = 0;
++  for (let match = NAMED_ISSUE_RE.exec(text); match; match = NAMED_ISSUE_RE.exec(text)) {
++    named.push({ number: Number(match[1]), name: match[2]!, severity: match[3] as DiagnosisSeverity });
++  }
++  if (named.length) return named;
++
++  const legacy: DiagnosisIssueHeader[] = [];
++  LEGACY_ISSUE_RE.lastIndex = 0;
++  for (let match = LEGACY_ISSUE_RE.exec(text); match; match = LEGACY_ISSUE_RE.exec(text)) {
++    legacy.push({ number: Number(match[1]), name: `issue_${match[1]}`, severity: match[2] as DiagnosisSeverity });
++  }
++  return legacy;
++}
++
++export function hasDiagnosisIssues(text: string): boolean {
++  return parseDiagnosisIssueHeaders(text).length > 0;
++}

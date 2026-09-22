@@ -1,8 +1,10 @@
 import type { ModelRef } from "@harness/template/types";
+import type { CanonicalPart } from "@harness/template/llm/protocol";
 import type { RouteDef } from "@harness/template";
 
 import type { MappingFactsSource } from "../tools_mesh2code/mapping-facts.ts";
 import type { MappingVisionInput } from "../agents_mesh2code/mapping-vision.ts";
+import type { GenerateResult } from "../llm/generate.ts";
 import { runMappingAgent } from "../agents_mesh2code/mapping-agent.ts";
 
 export interface MappingCriticView {
@@ -21,11 +23,6 @@ export interface MappingCriticContext {
   partsColorLegend: string;
 }
 
-export interface CriticFeedback {
-  text: string;
-  actionable: boolean;
-}
-
 /** Mapping-specific data prepared from the current CAD state. */
 export interface MappingCriticInput {
   source: MappingFactsSource;
@@ -35,10 +32,13 @@ export interface MappingCriticInput {
 
 export type MappingCritic = (args: {
   context: MappingCriticContext;
+  /** Same multimodal input supplied to the visual critic this cycle. */
+  parts: CanonicalPart[];
   route: RouteDef<unknown>;
   model: ModelRef;
+  label?: string;
   signal?: AbortSignal;
-}) => Promise<CriticFeedback>;
+}) => Promise<GenerateResult>;
 
 export type PrepareMappingCriticInput =
   (context: MappingCriticContext) => Promise<MappingCriticInput>;
@@ -49,20 +49,21 @@ export type PrepareMappingCriticInput =
  * produced for an earlier CAD buffer.
  */
 export function makeMappingCritic(prepare: PrepareMappingCriticInput): MappingCritic {
-  return async ({ context, route, model, signal }) => {
+  return async ({ context, parts, route, model, signal }) => {
     const input = await prepare(context);
+    const vision = {
+      ...input.vision,
+      ...(input.vision.criticParts === undefined
+        ? { criticParts: parts }
+        : {}),
+    };
     const result = await runMappingAgent({
       ...input,
+      vision,
       route,
       model,
       ...(signal ? { signal } : {}),
     });
-    const text = result.trim();
-    return { text, actionable: mappingFeedbackHasIssue(text) };
+    return { ...result, text: result.text.trim() };
   };
-}
-
-/** Keep the direct-refine handoff small: only a supported region can trigger a patch. */
-export function mappingFeedbackHasIssue(text: string): boolean {
-  return /^\s*STATUS:\s*ok\b/im.test(text) && /^\s*REGION\s+\d+/im.test(text);
 }
