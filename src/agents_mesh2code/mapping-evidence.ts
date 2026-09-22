@@ -90,7 +90,7 @@ export function buildMappingEvidence(cells: JsonObject[]): MappingEvidence {
   const parts = [...cellsByPart].map(([partId, partCells]) => {
     const evidence = selectEvidence(partId, partCells).map((candidate) => candidate.value);
     for (const item of evidence) initialEvidenceIds.add(String(item.id));
-    return { partId, evidence } as JsonObject;
+    return { partId, cellCount: partCells.length, evidence } as JsonObject;
   });
   for (const [partId, partCells] of cellsByPart) {
     for (const cell of partCells) evidenceOwners.set(`${partId}:${cell.depth}:${cell.prefix}`, partId);

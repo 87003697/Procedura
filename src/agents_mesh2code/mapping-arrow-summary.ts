@@ -43,9 +43,3 @@ export function summarizeMappingArrows(partId: string, cells: JsonObject[], evid
     directionCoherence: length(unit) / totalWeight,
   };
 }
-
-export function buildMappingArrowSummaries(evidence: MappingEvidence): JsonObject[] {
-  return [...evidence.cellsByPart.entries()]
-    .map(([partId, cells]) => summarizeMappingArrows(partId, cells, evidence))
-    .filter((summary): summary is JsonObject => summary !== undefined);
-}

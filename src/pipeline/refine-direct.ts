@@ -60,7 +60,8 @@ import { parsePatchResponse, applyPatch } from "./refine-patch.ts";
 import { writeFinalOutputs, DEFAULT_REFINE_STEPS } from "./refine.ts";
 import type { RefineOpts, RefineResult } from "./refine.ts";
 import { timeStage } from "./stage-timer.ts";
-import type { CriticFeedback, MappingCritic } from "./mapping-critic.ts";
+import type { MappingCritic } from "./mapping-critic.ts";
+import { hasDiagnosisIssues } from "./diagnosis-format.ts";
 
 const DIAGNOSE_PROMPT_PATH = new URL("./diagnose-prompt.md", import.meta.url).pathname;
 const PATCH_PROMPT_PATH = new URL("./refine-patch-prompt.md", import.meta.url).pathname;
@@ -69,6 +70,46 @@ const PATCH_PROMPT_PATH = new URL("./refine-patch-prompt.md", import.meta.url).p
 const REFINE_VIEWS = [
   "front", "back", "left", "right", "top", "bottom", "isometric",
 ] as const;
+
+function buildPairedViewParts(
+  references: readonly { label: string; path: string }[],
+  candidates: readonly { view: string; path: string }[],
+): CanonicalPart[] | null {
+  if (!references.length) return null;
+  const referenceLabels = new Set(references.map((reference) => reference.label));
+  const candidateLabels = new Set(candidates.map((candidate) => candidate.view));
+  const candidatesByView = new Map(candidates.map((candidate) => [candidate.view, candidate]));
+  if (
+    references.length !== REFINE_VIEWS.length ||
+    candidates.length !== REFINE_VIEWS.length ||
+    referenceLabels.size !== REFINE_VIEWS.length ||
+    candidateLabels.size !== REFINE_VIEWS.length ||
+    [...referenceLabels].some((label) => !REFINE_VIEWS.includes(label as (typeof REFINE_VIEWS)[number])) ||
+    [...candidateLabels].some((label) => !REFINE_VIEWS.includes(label as (typeof REFINE_VIEWS)[number])) ||
+    REFINE_VIEWS.some((view) => !referenceLabels.has(view) || !candidateLabels.has(view))
+  ) return null;
+
+  return references.flatMap((reference, index): CanonicalPart[] => {
+    const candidate = candidatesByView.get(reference.label)!;
+    return [
+      {
+        kind: "text",
+        text: `=== VIEW PAIR: ${reference.label}${index === 0 ? " (primary)" : ""} ===\nTARGET / GT:`,
+      },
+      {
+        kind: "image",
+        data: readFileSync(reference.path).toString("base64"),
+        mimeType: "image/png",
+      },
+      { kind: "text", text: "CURRENT / CAD parts-colour view:" },
+      {
+        kind: "image",
+        data: readFileSync(candidate.path).toString("base64"),
+        mimeType: "image/png",
+      },
+    ];
+  });
+}
 
 const RENDER_SIZE = Number(process.env["PROCEDURA_FEEDBACK_RENDER_SIZE"] ?? "1024") || 1024;
 /** Patch attempts per cycle: one, plus repairs when it fails to parse/compile. */
@@ -135,21 +176,6 @@ const FENCE = "`".repeat(3);
 // ──────────────────────────────────────────────────────────────────────────
 // Diagnosis parsing
 // ──────────────────────────────────────────────────────────────────────────
-
-/**
- * Does the diagnosis list at least one HIGH issue?
- *
- * The reviewer prompt specifies NUMBERED issue lines —
- * `1. [HIGH] [modules: a, b] <problem>. FIX: <direction>` — so the tag sits
- * after an enumerator, not at the start of the line. An earlier version of this
- * matched only a leading/bulleted tag and therefore read a diagnosis with four
- * HIGH issues as clean, ending the refine on its first cycle having changed
- * nothing. Accept a numbered, bulleted, or bare tag; require the tag to open
- * the issue so prose like "no [HIGH] issues remain" cannot trip it.
- */
-export function hasHighIssue(diagnosis: string): boolean {
-  return /^[ \t]*(?:\d+[.)]|[-*])?[ \t]*\[HIGH\]/im.test(diagnosis);
-}
 
 /**
  * Module names the reviewer named, in the order it named them. Matched against
@@ -347,15 +373,20 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
     state.latestViewsScad = state.scad;
     await ensureConnectivity(state);
 
+    const pairedParts = buildPairedViewParts(opts.referenceImages ?? [], rv.views);
+    const comparisonParts = pairedParts ?? [
+      ...referenceParts,
+      ...state.latestViews.flatMap((view): CanonicalPart[] => [
+        { kind: "text", text: `${view.label}:` },
+        { kind: "image", data: readFileSync(view.path).toString("base64"), mimeType: "image/png" },
+      ]),
+    ];
+
     // ── 2. Critics. Both review the same compiled/rendered CAD state. ─────
     const criticParts: CanonicalPart[] = [
       { kind: "text", text: buildDiagnoseLeadText(state, { fixerHasTools: false }) },
-      ...referenceParts,
+      ...comparisonParts,
     ];
-    for (const v of state.latestViews) {
-      criticParts.push({ kind: "text", text: `${v.label}:` });
-      criticParts.push({ kind: "image", data: readFileSync(v.path).toString("base64"), mimeType: "image/png" });
-    }
     criticParts.push({
       kind: "text",
       text: "=== CURRENT SCAD CODE ===\n" + FENCE + "openscad\n" + state.scad + "\n" + FENCE + "\n\n" +
@@ -379,44 +410,44 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
     const mappingPromise = opts.mappingCritic
       ? timeStage("llm.mapping-critic", () => opts.mappingCritic!({
           context: mappingContext,
+          parts: criticParts,
           route,
           model,
+          label: `mapping-critic c${cycle}`,
           ...(opts.signal ? { signal: opts.signal } : {}),
         }))
       : Promise.resolve(null);
 
     let diagnosis: string;
-    let visualFeedback: CriticFeedback;
-    let mappingFeedback: CriticFeedback | null;
+    let visualDiagnosis: string;
+    let mappingDiagnosis: string;
+    let visualActionable: boolean;
+    let mappingActionable: boolean;
     try {
       const [visualResult, mappingResult] = await Promise.all([visualPromise, mappingPromise]);
       llmCalls += opts.mappingCritic ? 2 : 1;
-      visualFeedback = {
-        text: visualResult.text.trim(),
-        actionable: hasHighIssue(visualResult.text),
-      };
-      mappingFeedback = mappingResult;
-      const mappingDiagnosis = mappingFeedback?.text.trim() ?? "";
+      visualDiagnosis = visualResult.text.trim();
+      mappingDiagnosis = mappingResult?.text.trim() ?? "";
+      visualActionable = hasDiagnosisIssues(visualDiagnosis);
+      mappingActionable = hasDiagnosisIssues(mappingDiagnosis);
       diagnosis = mappingDiagnosis
-        ? "=== VISUAL CRITIC ===\n" + visualFeedback.text + "\n\n=== MAPPING CRITIC ===\n" + mappingDiagnosis
-        : visualFeedback.text;
+        ? "=== VISUAL CRITIC ===\n" + visualDiagnosis + "\n\n=== MAPPING CRITIC ===\n" + mappingDiagnosis
+        : visualDiagnosis;
       writeFileSync(join(stepDir, "diagnosis.txt"), diagnosis, "utf8");
       if (visualResult.reasoning) writeFileSync(join(stepDir, "diagnose_thinking.txt"), visualResult.reasoning, "utf8");
+      if (mappingResult?.reasoning) writeFileSync(join(stepDir, "mapping_thinking.txt"), mappingResult.reasoning, "utf8");
       if (mappingDiagnosis) writeFileSync(join(stepDir, "mapping.txt"), mappingDiagnosis, "utf8");
     } catch (e) {
       log(`  critic failed: ${(e as Error).message.slice(0, 200)} — ending refine`);
       break;
     }
 
-    const visualDiagnosis = visualFeedback.text;
-    const mappingDiagnosis = mappingFeedback?.text.trim() ?? "";
-
     const summaryLine = visualDiagnosis.split("\n").find((l) => /^\s*summary:/i.test(l)) ?? visualDiagnosis.slice(0, 120);
     summary = summaryLine.replace(/^\s*summary:\s*/i, "").trim();
     state.diagnosisHistory.push({ cycle, summary, raw: diagnosis });
     log(`  critic: ${summary.slice(0, 160)}`);
 
-    if (!visualFeedback.actionable && !(mappingFeedback?.actionable ?? false)) {
+    if (!visualActionable && !mappingActionable) {
       log(`  no actionable critic issues remain — finishing`);
       verdict = "ok";
       break;

@@ -139,7 +139,10 @@ const mappingCritic = makeMappingCritic(async (context) => {
 
 Pass that callback through the Mesh-to-CAD host or `runProcedura`. Each cycle must
 prepare the Mapping source from the `context.stlPath` for that cycle. The Mapping
-Agent returns the plain-text diagnosis consumed by refine; its input schema,
-bounded facts, plan coverage, and optional inspection-tool argument checks remain
-inside the Mapping path. The refine path does not parse a Mapping JSON artifact.
-Without a Mapping critic, ordinary visual direct refine is unchanged.
+Agent returns the same plain-text diagnosis shape as the visual critic:
+`SUMMARY`, `ISSUES`, a severity tag, `[modules: ...]`, and a `FIX:` direction.
+The Mapping issue keeps its evidence-grounded candidate→GT axis correction inside
+the problem and fix text. Its input schema, bounded facts, plan coverage, and
+optional inspection-tool argument checks remain inside the Mapping path. The
+refine path does not parse a Mapping JSON artifact. Without a Mapping critic,
+ordinary visual direct refine is unchanged.
