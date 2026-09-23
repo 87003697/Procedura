@@ -74,7 +74,10 @@ is read by candidate generation, costs, support, or Sinkhorn or included in the 
 For the retained Plan 4 transformer validation, `scripts/prepare_mapping_input.py`
 converts the private GT OBJ, final candidate OBJ, canonical whole STL, and the
 renderer-retained per-part STL manifest into that same contract. It uses the
-fixed `[-1, 1]^3` root, verifies whole STL/OBJ frame identity, and applies the
+`[-1, 1]^3` root by default, or the root given by `--root-min x y z --root-side s`
+in mesh units. Cell masses are surface areas in root half-side squared units, so the
+unbalanced transport balance is the same whether the meshes are normalized or kept
+in candidate SCAD millimetres. It verifies whole STL/OBJ frame identity, and applies the
 single combined-part-bounds-to-final-OBJ uniform transform; it performs no ICP,
 rotation, or semantic inference. Because the final Boolean union is retriangulated,
 each final-surface triangle inherits the geometrically nearest retained part-surface
@@ -83,6 +86,21 @@ The
 generated input remains private because its occupied cells and provenance are
 reconstructive. The separate metadata file records paths, bounds, counts,
 transform, time, and peak memory without containing node geometry.
+
+When the reference mesh keeps its own arbitrary pose and scale, such as a fixture
+OBJ scaled for a paid retest, run `scripts/register_reference.py` first. It fits
+one similarity transform (uniform scale, proper rotation, translation) of the
+reference onto the candidate with PCA-seeded symmetric nearest-neighbour ICP and
+writes the registered reference STL in candidate coordinates plus a metadata file
+with the transform and before/after symmetric RMS. Reflections are never fitted,
+so a mirrored candidate still appears as residual. Without this step, the mapper
+reports the pose and scale gap between the two frames as surface displacement.
+
+```bash
+.venv/bin/python scripts/register_reference.py \
+  --reference reference.stl --candidate candidate.stl \
+  --output reference-registered.stl --metadata registration.json
+```
 
 The real-data ablation writes four private reports plus one aggregate summary:
 
@@ -122,7 +140,10 @@ parts-colour views, legend, and step directory, then returns one Mapping text
 feedback string. The host adapter is responsible for preparing the current
 candidate/target octree `input` and `report`, the existing `plan.json` semantic
 plan, and the front/top/right candidate/comparison images required by
-`runMappingAgent`.
+`runMappingAgent`. The adapter must keep both meshes in candidate SCAD millimetres
+and pass an octree root in those units: the Mapping Agent treats every `*Mm`
+length, `locationMm`, and the `inspect_mapping_part` radius as SCAD millimetres,
+and the radius cap is eight finest cells of that root.
 
 ```ts
 import { makeMappingCritic } from "../../src/pipeline/mapping-critic.ts";

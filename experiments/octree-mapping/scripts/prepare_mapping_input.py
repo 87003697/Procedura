@@ -38,14 +38,18 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--output", required=True)
     result.add_argument("--metadata", required=True)
     result.add_argument("--depth", type=int, default=6)
+    result.add_argument("--root-min", type=float, nargs=3, default=(-1.0, -1.0, -1.0), help="octree root corner in mesh units")
+    result.add_argument("--root-side", type=float, default=2.0, help="octree root edge length in mesh units")
     return result
 
 
 def main() -> None:
     args = parser().parse_args()
     started = time.perf_counter()
-    root_min = np.asarray((-1.0, -1.0, -1.0))
-    root_side = 2.0
+    root_min = np.asarray(args.root_min)
+    root_side = args.root_side
+    # UOT uses absolute masses, so measure areas in root half-side units to keep it independent of the length unit.
+    mass_unit = (root_side / 2.0) ** 2
 
     gt = load_obj(args.gt_obj)
     candidate = load_obj(args.candidate_obj)
@@ -83,13 +87,13 @@ def main() -> None:
         "schema": "procedura.octree-mapping-input/2",
         "frame": {"minMm": root_min.tolist(), "sideMm": root_side, "maxDepth": args.depth},
         "gt": {"cells": [
-            {"prefix": prefix, "mass": cell.mass, "normal": cell.normal.tolist()}
+            {"prefix": prefix, "mass": cell.mass / mass_unit, "normal": cell.normal.tolist()}
             for prefix, cell in sorted(gt_cells.items())
         ]},
         "candidate": {"cells": [
             {
                 "prefix": prefix,
-                "mass": cell.mass,
+                "mass": cell.mass / mass_unit,
                 "normal": cell.normal.tolist(),
                 "parts": provenance[prefix],
             }
@@ -99,7 +103,7 @@ def main() -> None:
     Path(args.output).write_text(json.dumps(document, separators=(",", ":")) + "\n", encoding="utf-8")
     peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     metadata = {
-        "frame": {"minMm": root_min.tolist(), "sideMm": root_side, "depth": args.depth},
+        "frame": {"minMm": root_min.tolist(), "sideMm": root_side, "depth": args.depth, "massUnitArea": mass_unit},
         "inputs": {
             "gtObj": str(Path(args.gt_obj).resolve()),
             "candidateObj": str(Path(args.candidate_obj).resolve()),
