@@ -173,6 +173,10 @@ export function diagnosisAsksForRemoval(diagnosis: string): boolean {
 /** Markdown fence, built rather than written, so this source stays greppable. */
 const FENCE = "`".repeat(3);
 
+function compactHistoryField(value: string, limit: number): string {
+  return value.replace(/\s+/g, " ").trim().slice(0, limit);
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Diagnosis parsing
 // ──────────────────────────────────────────────────────────────────────────
@@ -332,6 +336,11 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
   let summary = "(no summary)";
   let accepted = 0;
   let llmCalls = 0;
+  const repairHistory: string[] = [];
+  const rememberRepair = (entry: string): void => {
+    repairHistory.push(entry);
+    if (repairHistory.length > 3) repairHistory.shift();
+  };
 
   for (let cycle = 1; cycle <= maxCycles; cycle++) {
     if (opts.signal?.aborted) { verdict = "aborted"; break; }
@@ -503,6 +512,20 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
         text: "=== CURRENT SCAD SOURCE (complete) ===\n" + FENCE + "openscad\n" +
           scadBefore + "\n" + FENCE + "\n",
       });
+      const historyLines = cycle > 1
+        ? state.diagnosisHistory
+          .filter((item) => item.cycle < cycle)
+          .slice(-3)
+          .map((item) => `cycle ${item.cycle} diagnosis: ${compactHistoryField(item.summary, 240)}`)
+          .concat(repairHistory.slice(-3))
+        : [];
+      if (historyLines.length) {
+        patchParts.push({
+          kind: "text",
+          text: "=== REPAIR HISTORY (prior direct-refine cycles) ===\n" +
+            historyLines.join("\n").slice(0, 3000) + "\n",
+        });
+      }
       patchParts.push({
         kind: "text",
         text:
@@ -529,11 +552,20 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
         writeFileSync(join(stepDir, `patch_response_${attempt}.txt`), raw, "utf8");
         if (r.reasoning) writeFileSync(join(stepDir, `patch_thinking_${attempt}.txt`), r.reasoning, "utf8");
       } catch (e) {
-        log(`  patch call failed: ${(e as Error).message.slice(0, 160)}`);
+        repairNote = (e as Error).message.slice(0, 1200);
+        rememberRepair(compactHistoryField(
+          `cycle ${cycle}: rejected (llm); reason ${repairNote}; residual ${mappingDiagnosis || measurements}`,
+          900,
+        ));
+        log(`  patch call failed: ${repairNote.slice(0, 160)}`);
         break;
       }
 
-      const reject = (why: string): void => {
+      const reject = (kind: string, why: string): void => {
+        rememberRepair(compactHistoryField(
+          `cycle ${cycle}: rejected (${kind}); reason ${why}; residual ${mappingDiagnosis || measurements}`,
+          900,
+        ));
         // A rejection identical to the last one means the model re-sent the
         // same patch: re-prompting again asks the same question of the same
         // inputs. Every cycle of the gpt run burned all three attempts this
@@ -557,7 +589,7 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
 
       const parsed = parsePatchResponse(raw);
       if (!parsed) {
-        reject("Your reply contained no `=== MODULE name ===` or `=== PLACE name ===` block. " +
+        reject("parse", "Your reply contained no `=== MODULE name ===` or `=== PLACE name ===` block. " +
           "Emit at least one block, in exactly that format.");
         log(`  [patch ${attempt}] unparseable — re-prompting`);
         continue;
@@ -565,7 +597,7 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
 
       const applied = applyPatch(scadBefore, parsed);
       if (!applied.ok) {
-        reject(applied.error);
+        reject("apply", applied.error);
         log(`  [patch ${attempt}] rejected:\n${applied.error.split("\n").map((l) => "    " + l).join("\n")}`);
         if (repeatedRejection) { log(`  [patch ${attempt}] same rejection as the last attempt — not re-prompting`); break; }
         continue;
@@ -581,7 +613,7 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
           () => compileScad(applied.scad, { outputDir: patchDir }));
         stlPath = r.stlPath;
       } catch (e) {
-        reject("After applying your patch, OpenSCAD reported:\n\n" +
+        reject("compile", "After applying your patch, OpenSCAD reported:\n\n" +
           (e as Error).message.slice(0, 2000));
         log(`  [patch ${attempt}] compile failed — re-prompting: ` +
             `${(e as Error).message.split("\n").find((l) => /error/i.test(l))?.slice(0, 160) ?? (e as Error).message.slice(0, 160)}`);
@@ -599,7 +631,7 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
       // the diagnosis's intent.
       const floor = removalWanted ? REMOVAL_FACET_RATIO : MIN_FACET_RATIO;
       if (facetsBefore !== null && facetsAfter !== null && facetsAfter < facetsBefore * floor) {
-        reject(
+        reject("facet",
           `Your patch compiled but destroyed detail: the model went from ` +
           `${facetsBefore.toLocaleString()} to ${facetsAfter.toLocaleString()} facets ` +
           `(${(facetsAfter / facetsBefore * 100).toFixed(0)}% — the floor is ` +
@@ -626,6 +658,12 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
         reason: parsed.reason, attempt,
         facets: { before: facetsBefore, after: facetsAfter },
       }, null, 2), "utf8");
+      rememberRepair(compactHistoryField(
+        `cycle ${cycle}: accepted; touched ${applied.touched.slice(0, 8).join(", ")}; ` +
+        `reason ${parsed.reason}; facets ${facetsBefore ?? "unknown"} -> ${facetsAfter ?? "unknown"}; ` +
+        `residual ${mappingDiagnosis || measurements}`,
+        900,
+      ));
       log(`  [patch ${attempt}] ACCEPTED — ${applied.touched.join(", ")}`);
       if (parsed.reason) log(`      reason: ${parsed.reason.replace(/^reason:\s*/i, "").slice(0, 200)}`);
       break;
