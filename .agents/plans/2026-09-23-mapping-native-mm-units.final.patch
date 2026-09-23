@@ -1,0 +1,357 @@
+diff --git a/src/agents_mesh2code/mapping-agent.ts b/src/agents_mesh2code/mapping-agent.ts
+index 3814448..43a851a 100644
+--- a/src/agents_mesh2code/mapping-agent.ts
++++ b/src/agents_mesh2code/mapping-agent.ts
+@@ -16,7 +16,7 @@ const SYSTEM = [
+   "Treat displacementMm as the correction vector in the mapping frame, candidate → GT. Never invert its sign or replace it with an ambiguous front/back description. The initial facts contain representative cell locations and vectors; preserve their spatial pattern instead of replacing it with a single module-average arrow. A displacement is not proof that the owning part moved: use coherent evidence and the SCAD source before naming a shared parameter or placement expression.",
+   "Before writing each issue, classify the supported source-level cause as one of: local-module geometry, shared parameter, parent placement, cumulative downstream placement, or unresolved. If residual magnitude or direction changes progressively along a connected module sequence and the SCAD source shows downstream placements depending on a common angle, length, datum, or ancestor expression, classify it as cumulative downstream placement. In that case identify the shared parameter or placement expression that should be changed and describe one structural repair strategy. The per-cell vectors are evidence for that strategy, not a list of independent edits.",
+   "Do not fit or assume a rigid translation, rotation, affine transform, or cumulative-drift model as the repair. A cumulative downstream placement diagnosis is allowed only when the observed spatial pattern and SCAD dependency support it. Do not recommend independent translate() compensation for every affected module when a shared source expression explains the pattern. If no shared source construct is supported, state the affected region and leave the source-level cause unresolved.",
+-  "Mapping-frame displacement values are not automatically raw SCAD coordinates. Do not copy them into a PLACE block or present them as direct per-module patch values unless the visual context or mapping facts provide the conversion and the source-level cause is local. For shared or cumulative errors, report the range and trend as evidence, then prioritize the shared angle, length, datum, or parent placement instead of emitting one translate correction per module.",
++  "All mapping lengths (locationMm, displacementMm, sideMm, radiusMm) are candidate SCAD millimetres, and locationMm is a SCAD world coordinate, so they compare directly with SCAD parameters and placement values. The finest cell edge, mappingFrame.sideMm / 2^maxDepth, is the mapping resolution: treat residuals below about one cell edge as within resolution unless they are coherent across many cells. For a local cause, state the correction in millimetres. For shared or cumulative errors, report the range and trend as evidence, then prioritize the shared angle, length, datum, or parent placement instead of emitting one translate correction per module.",
+   "If the initial evidence is insufficient, call inspect_mapping_part with a known partId and evidenceId. Omit radiusMm/depth first to judge the default coarse parent octree region (two levels coarser than finest); use the finest depth or a smaller radius only when that coarse summary remains ambiguous. Continue inspecting known parts as needed; stop when the evidence is sufficient and return the final text diagnosis.",
+   "Return at most two supported mapping issues as plain text using the same diagnosis format as the visual critic. Order issues from most important to least important and give each a short stable snake_case name. Use: SUMMARY: <one-line verdict>, then ISSUES:, then numbered entries of the form `1. <issue_name> [HIGH|MED|LOW] [modules: ...] PROBLEM: <concrete mapped discrepancy>. EVIDENCE: <supported evidence>. CAUSE: <local-module|shared-parameter|parent-placement|cumulative-downstream-placement|unresolved>. TARGET: <exact supported SCAD parameter, placement expression, or module dependency to inspect/change; use unresolved when the source does not support a name>. CONSTRAINTS: <must-preserve or must-avoid condition, or none>. FIX: <candidate→GT direction and affected region; for shared or cumulative errors describe the trend/range, not independent per-module translate values>.` If no region is supported, return `SUMMARY: no supported mapping issue` followed by `ISSUES: (none — mapping evidence is insufficient for a grounded region-level correction)`. Output only this diagnosis text with no JSON, Markdown fence, STATUS/REGION wrapper, or extra preamble.",
+   "Use [HIGH] for a supported wrong placement, wrong orientation, or disconnected region that materially affects the model; use [MED] for a smaller but actionable localized residual; use [LOW] only for a minor residual that should not drive a repair by itself. Severity labels the issue, while issue order determines repair priority. Every issue must name the candidate module(s) from the semantic plan and preserve the candidate→GT sign convention in FIX. Do not claim unsupported source-code locations, raw mesh, or pass/fail authority. Do not name a shared parameter unless the complete SCAD source visibly supports that dependency.",
+@@ -123,8 +123,10 @@ export async function runMappingAgent(args: { source: MappingFactsSource; semant
+   const semanticPlan = parseSemanticPlan(args.semanticPlan);
+   const evidence = buildMappingEvidence(await readCells(args.source));
+   validatePlanCoverage(evidence.partIds, semanticPlan);
+-  const inspectTool = makeInspectMappingPartTool(evidence);
+   const input = args.source.input as JsonObject;
++  // Cap local inspection at eight finest octree cells.
++  const frame = input.frame as JsonObject;
++  const inspectTool = makeInspectMappingPartTool(evidence, 8 * Number(frame.sideMm) / 2 ** Number(frame.maxDepth));
+   const facts: JsonObject = {
+     mappingFrame: input.frame ?? null,
+     semanticPlan,
+diff --git a/src/agents_mesh2code/mapping-inspect-tool.ts b/src/agents_mesh2code/mapping-inspect-tool.ts
+index 5b8385e..5186087 100644
+--- a/src/agents_mesh2code/mapping-inspect-tool.ts
++++ b/src/agents_mesh2code/mapping-inspect-tool.ts
+@@ -2,43 +2,42 @@ import type { JsonObject } from "@harness/template/types";
+ import type { ToolDescriptor, ToolExecutor, ToolResult } from "@harness/template/tool";
+ import { inspectMappingPart, type MappingEvidence } from "./mapping-evidence.ts";
+ 
+-const descriptor: ToolDescriptor = {
+-  name: "inspect_mapping_part",
+-  description: "Inspect a known candidate part at its coarse parent octree region by default; provide depth=maxDepth or radiusMm for finer local detail, and provide an evidenceId when setting radiusMm. Use localSummary and neighborParts to verify a region, not to discover unrelated part defects; nearby evidence can reflect transport spillover.",
+-  owner: { kind: "core" },
+-  inputSchema: {
+-    type: "object",
+-    additionalProperties: false,
+-    properties: {
+-      partId: { type: "string" },
+-      evidenceId: { type: "string" },
+-      limit: { type: "integer", minimum: 1, maximum: 8 },
+-      radiusMm: { type: "number", exclusiveMinimum: 0, maximum: 0.25 },
+-      depth: { type: "integer", minimum: 3, maximum: 6 },
+-    },
+-    required: ["partId"],
+-  } satisfies JsonObject,
+-};
+-
+-function validateInput(input: JsonObject): { partId: string; evidenceId?: string; limit: number; radiusMm?: number; depth?: number } {
++function validateInput(input: JsonObject, maxRadiusMm: number): { partId: string; evidenceId?: string; limit: number; radiusMm?: number; depth?: number } {
+   if (Object.keys(input).some((key) => !["partId", "evidenceId", "limit", "radiusMm", "depth"].includes(key))) throw Error("unknown inspect_mapping_part argument");
+   if (typeof input.partId !== "string" || !input.partId) throw Error("inspect_mapping_part requires partId");
+   if (input.evidenceId !== undefined && (typeof input.evidenceId !== "string" || !input.evidenceId)) throw Error("invalid inspect_mapping_part evidenceId");
+   const limit = input.limit === undefined ? 8 : input.limit;
+   if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 8) throw Error("invalid inspect_mapping_part limit");
+   if (input.radiusMm !== undefined && (typeof input.radiusMm !== "number" || !Number.isFinite(input.radiusMm) || input.radiusMm <= 0)) throw Error("invalid inspect_mapping_part radiusMm");
+-  if (input.radiusMm !== undefined && input.radiusMm > 0.25) throw Error("inspect_mapping_part radiusMm exceeds 0.25");
++  if (input.radiusMm !== undefined && input.radiusMm > maxRadiusMm) throw Error(`inspect_mapping_part radiusMm exceeds ${maxRadiusMm}`);
+   if (input.radiusMm !== undefined && input.evidenceId === undefined) throw Error("inspect_mapping_part radiusMm requires evidenceId");
+   if (input.depth !== undefined && (typeof input.depth !== "number" || !Number.isInteger(input.depth) || input.depth < 3 || input.depth > 6)) throw Error("invalid inspect_mapping_part depth");
+   return { partId: input.partId, ...(input.evidenceId !== undefined ? { evidenceId: input.evidenceId } : {}), limit, ...(input.radiusMm !== undefined ? { radiusMm: input.radiusMm } : {}), ...(input.depth !== undefined ? { depth: input.depth } : {}) };
+ }
+ 
+-export function makeInspectMappingPartTool(evidence: MappingEvidence): ToolExecutor {
++export function makeInspectMappingPartTool(evidence: MappingEvidence, maxRadiusMm: number): ToolExecutor {
++  const descriptor: ToolDescriptor = {
++    name: "inspect_mapping_part",
++    description: "Inspect a known candidate part at its coarse parent octree region by default; provide depth=maxDepth or radiusMm for finer local detail, and provide an evidenceId when setting radiusMm. Use localSummary and neighborParts to verify a region, not to discover unrelated part defects; nearby evidence can reflect transport spillover.",
++    owner: { kind: "core" },
++    inputSchema: {
++      type: "object",
++      additionalProperties: false,
++      properties: {
++        partId: { type: "string" },
++        evidenceId: { type: "string" },
++        limit: { type: "integer", minimum: 1, maximum: 8 },
++        radiusMm: { type: "number", exclusiveMinimum: 0, maximum: maxRadiusMm },
++        depth: { type: "integer", minimum: 3, maximum: 6 },
++      },
++      required: ["partId"],
++    } satisfies JsonObject,
++  };
+   return {
+     descriptor,
+     async execute(raw: JsonObject): Promise<ToolResult> {
+       try {
+-        const input = validateInput(raw);
++        const input = validateInput(raw, maxRadiusMm);
+         return { ok: true, output: inspectMappingPart(evidence, input.partId, input.evidenceId, input.limit, input.radiusMm, input.depth) };
+       } catch (error) {
+         return { ok: false, error: error instanceof Error ? error.message : String(error) };
+diff --git a/src/tools_mesh2code/render_mapping_report.py b/src/tools_mesh2code/render_mapping_report.py
+index a27ae79..b9efa21 100644
+--- a/src/tools_mesh2code/render_mapping_report.py
++++ b/src/tools_mesh2code/render_mapping_report.py
+@@ -21,7 +21,7 @@ def decode(prefix, depth):
+     return np.asarray(xyz, dtype=float)
+ def render(report_path, gt_path, candidate_path, out_dir, max_arrows=220):
+     report = json.loads(report_path.read_text(encoding="utf-8")); level = max(report["levels"], key=lambda x: x["summary"]["depth"])
+-    depth = int(level["summary"]["depth"]); frame = report["frame"]; minimum = np.asarray(frame["minMm"], dtype=float); scale = float(frame["sideMm"]) / (1 << depth)
++    depth = int(level["summary"]["depth"]); frame = report["frame"]; minimum = np.asarray(frame["minMm"], dtype=float); side = float(frame["sideMm"]); scale = side / (1 << depth)
+     cells = [c for c in level["candidateCells"] if c["displacementMm"] is not None]; cells.sort(key=lambda c: c["prefix"])
+     if len(cells) > max_arrows: cells = [cells[i] for i in np.linspace(0, len(cells)-1, max_arrows, dtype=int)]
+     meshes = [(load_obj(gt_path), "#2f73b8", .20), (load_obj(candidate_path), "#777777", .16)]; out_dir.mkdir(parents=True, exist_ok=True); outputs = []
+@@ -31,7 +31,7 @@ def render(report_path, gt_path, candidate_path, out_dir, max_arrows=220):
+         for cell in cells:
+             source = minimum + (decode(int(cell["prefix"]), depth) + .5) * scale; vector = np.asarray(cell["displacementMm"], dtype=float)
+             ax.quiver(*source, *vector, color=plt.cm.plasma(float(np.clip(cell["sourceMarginalRatio"],0,1))), linewidth=.7, arrow_length_ratio=.12, alpha=.8)
+-        ax.set(xlim=(-1,1), ylim=(-1,1), zlim=(-1,1), xlabel="X", ylabel="Y", zlabel="Z"); ax.set_box_aspect((1,1,1))
++        ax.set(xlim=(minimum[0], minimum[0]+side), ylim=(minimum[1], minimum[1]+side), zlim=(minimum[2], minimum[2]+side), xlabel="X", ylabel="Y", zlabel="Z"); ax.set_box_aspect((1,1,1))
+         ax.set_title("All mapped cells\nGT blue · candidate gray · arrows = candidate → GT (/3 displacement target proxy)"); ax.view_init(elev=elev, azim=azim)
+         scalar = plt.cm.ScalarMappable(cmap="plasma", norm=plt.Normalize(0,1)); scalar.set_array([]); fig.colorbar(scalar, ax=ax, shrink=.55, label="source marginal ratio")
+         output = out_dir / ("mapping-report-" + name + ".png"); fig.tight_layout(); fig.savefig(output); plt.close(fig); outputs.append(output)
+diff --git a/experiments/octree-mapping/scripts/prepare_mapping_input.py b/experiments/octree-mapping/scripts/prepare_mapping_input.py
+index 851fcf7..8204d12 100644
+--- a/experiments/octree-mapping/scripts/prepare_mapping_input.py
++++ b/experiments/octree-mapping/scripts/prepare_mapping_input.py
+@@ -38,14 +38,18 @@ def parser() -> argparse.ArgumentParser:
+     result.add_argument("--output", required=True)
+     result.add_argument("--metadata", required=True)
+     result.add_argument("--depth", type=int, default=6)
++    result.add_argument("--root-min", type=float, nargs=3, default=(-1.0, -1.0, -1.0), help="octree root corner in mesh units")
++    result.add_argument("--root-side", type=float, default=2.0, help="octree root edge length in mesh units")
+     return result
+ 
+ 
+ def main() -> None:
+     args = parser().parse_args()
+     started = time.perf_counter()
+-    root_min = np.asarray((-1.0, -1.0, -1.0))
+-    root_side = 2.0
++    root_min = np.asarray(args.root_min)
++    root_side = args.root_side
++    # UOT uses absolute masses, so measure areas in root half-side units to keep it independent of the length unit.
++    mass_unit = (root_side / 2.0) ** 2
+ 
+     gt = load_obj(args.gt_obj)
+     candidate = load_obj(args.candidate_obj)
+@@ -83,13 +87,13 @@ def main() -> None:
+         "schema": "procedura.octree-mapping-input/2",
+         "frame": {"minMm": root_min.tolist(), "sideMm": root_side, "maxDepth": args.depth},
+         "gt": {"cells": [
+-            {"prefix": prefix, "mass": cell.mass, "normal": cell.normal.tolist()}
++            {"prefix": prefix, "mass": cell.mass / mass_unit, "normal": cell.normal.tolist()}
+             for prefix, cell in sorted(gt_cells.items())
+         ]},
+         "candidate": {"cells": [
+             {
+                 "prefix": prefix,
+-                "mass": cell.mass,
++                "mass": cell.mass / mass_unit,
+                 "normal": cell.normal.tolist(),
+                 "parts": provenance[prefix],
+             }
+@@ -99,7 +103,7 @@ def main() -> None:
+     Path(args.output).write_text(json.dumps(document, separators=(",", ":")) + "\n", encoding="utf-8")
+     peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+     metadata = {
+-        "frame": {"minMm": root_min.tolist(), "sideMm": root_side, "depth": args.depth},
++        "frame": {"minMm": root_min.tolist(), "sideMm": root_side, "depth": args.depth, "massUnitArea": mass_unit},
+         "inputs": {
+             "gtObj": str(Path(args.gt_obj).resolve()),
+             "candidateObj": str(Path(args.candidate_obj).resolve()),
+diff --git a/experiments/octree-mapping/scripts/register_reference.py b/experiments/octree-mapping/scripts/register_reference.py
+new file mode 100644
+index 0000000..55f05f9
+--- /dev/null
++++ b/experiments/octree-mapping/scripts/register_reference.py
+@@ -0,0 +1,135 @@
++"""Register a reference mesh onto a candidate mesh with one similarity transform."""
++
++from __future__ import annotations
++
++import argparse
++import itertools
++import json
++from pathlib import Path
++
++import numpy as np
++from scipy.spatial import cKDTree
++
++from octree_mapping.mesh_adapter import TriangleMesh, load_mesh
++
++
++def sample_surface(mesh: TriangleMesh, count: int, rng: np.random.Generator) -> np.ndarray:
++    triangles = mesh.triangles
++    edges_a = triangles[:, 1] - triangles[:, 0]
++    edges_b = triangles[:, 2] - triangles[:, 0]
++    areas = np.linalg.norm(np.cross(edges_a, edges_b), axis=1)
++    chosen = rng.choice(len(triangles), size=count, p=areas / areas.sum())
++    u, v = rng.random((2, count))
++    outside = u + v > 1.0
++    u[outside], v[outside] = 1.0 - u[outside], 1.0 - v[outside]
++    return triangles[chosen, 0] + u[:, None] * edges_a[chosen] + v[:, None] * edges_b[chosen]
++
++
++def similarity_from_pairs(source: np.ndarray, target: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
++    """Least-squares scale, proper rotation, and translation mapping source pairs onto target pairs."""
++    source_mean = source.mean(axis=0)
++    target_mean = target.mean(axis=0)
++    source_centered = source - source_mean
++    target_centered = target - target_mean
++    left, singular, right_t = np.linalg.svd(target_centered.T @ source_centered / len(source))
++    reflection = np.diag([1.0, 1.0, np.sign(np.linalg.det(left @ right_t))])
++    rotation = left @ reflection @ right_t
++    scale = float(np.trace(np.diag(singular) @ reflection) / source_centered.var(axis=0).sum())
++    return scale, rotation, target_mean - scale * rotation @ source_mean
++
++
++def parser() -> argparse.ArgumentParser:
++    result = argparse.ArgumentParser(description="Similarity-register a reference mesh onto a candidate mesh")
++    result.add_argument("--reference", required=True)
++    result.add_argument("--candidate", required=True)
++    result.add_argument("--output", required=True, help="binary STL of the reference in candidate coordinates")
++    result.add_argument("--metadata", required=True)
++    result.add_argument("--samples", type=int, default=4000)
++    result.add_argument("--iterations", type=int, default=100)
++    result.add_argument("--seed", type=int, default=0)
++    return result
++
++
++def main() -> None:
++    argument_parser = parser()
++    args = argument_parser.parse_args()
++    if args.samples < 1 or args.iterations < 1:
++        argument_parser.error("--samples and --iterations must be positive")
++    reference = load_mesh(args.reference)
++    candidate = load_mesh(args.candidate)
++
++    # Area-weighted surface samples make the fit independent of triangulation density.
++    rng = np.random.default_rng(args.seed)
++    reference_points = sample_surface(reference, args.samples, rng)
++    candidate_points = sample_surface(candidate, args.samples, rng)
++    candidate_tree = cKDTree(candidate_points)
++
++    # Symmetric nearest-neighbour RMS and pairings between moved reference samples and the candidate.
++    def _symmetric_fit(moved: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
++        forward_distance, forward_index = candidate_tree.query(moved)
++        backward_distance, backward_index = cKDTree(moved).query(candidate_points)
++        squared = forward_distance @ forward_distance + backward_distance @ backward_distance
++        return float(np.sqrt(squared / (len(moved) + len(candidate_points)))), forward_index, backward_index
++
++    # Seed ICP from every proper sign assignment of the matched principal axes.
++    reference_mean = reference_points.mean(axis=0)
++    candidate_mean = candidate_points.mean(axis=0)
++    reference_axes = np.linalg.eigh(np.cov(reference_points.T))[1][:, ::-1]
++    candidate_axes = np.linalg.eigh(np.cov(candidate_points.T))[1][:, ::-1]
++    initial_scale = float(np.sqrt(candidate_points.var(axis=0).sum() / reference_points.var(axis=0).sum()))
++    seeds = []
++    for signs in itertools.product((1.0, -1.0), repeat=3):
++        rotation = candidate_axes @ np.diag(signs) @ reference_axes.T
++        if np.linalg.det(rotation) > 0:
++            seeds.append((initial_scale, rotation, candidate_mean - initial_scale * rotation @ reference_mean))
++
++    # Symmetric pairs keep the scale estimate from collapsing onto a dense candidate patch.
++    trials = []
++    for scale, rotation, translation in seeds:
++        best_rms = np.inf
++        for _ in range(args.iterations):
++            rms, forward_index, backward_index = _symmetric_fit(scale * reference_points @ rotation.T + translation)
++            if rms >= best_rms * (1.0 - 1e-7):
++                break
++            else:
++                best_rms, fitted = rms, (scale, rotation, translation)
++                scale, rotation, translation = similarity_from_pairs(
++                    np.concatenate((reference_points, reference_points[backward_index])),
++                    np.concatenate((candidate_points[forward_index], candidate_points)),
++                )
++        trials.append((best_rms, *fitted))
++    rms, scale, rotation, translation = min(trials, key=lambda trial: trial[0])
++
++    # Write the registered reference as binary STL in candidate coordinates.
++    triangles = scale * reference.triangles @ rotation.T + translation
++    normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
++    lengths = np.linalg.norm(normals, axis=1, keepdims=True)
++    records = np.zeros(len(triangles), dtype=[("normal", "<f4", 3), ("vertices", "<f4", (3, 3)), ("attribute", "<u2")])
++    records["normal"] = np.divide(normals, lengths, out=np.zeros_like(normals), where=lengths > 0)
++    records["vertices"] = triangles
++    with open(args.output, "wb") as stream:
++        stream.write(b"registered reference".ljust(80, b"\0"))
++        stream.write(np.asarray(len(records), dtype="<u4").tobytes())
++        stream.write(records.tobytes())
++
++    # Record the fitted transform with symmetric RMS before and after registration.
++    metadata = {
++        "method": "PCA-seeded symmetric nearest-neighbour similarity ICP; distances in candidate units",
++        "reference": str(Path(args.reference).resolve()),
++        "candidate": str(Path(args.candidate).resolve()),
++        "samples": args.samples,
++        "iterations": args.iterations,
++        "seed": args.seed,
++        "scale": scale,
++        "rotation": rotation.tolist(),
++        "rotationDegrees": float(np.degrees(np.arccos(np.clip((np.trace(rotation) - 1.0) / 2.0, -1.0, 1.0)))),
++        "translation": translation.tolist(),
++        "unregisteredRms": _symmetric_fit(reference_points)[0],
++        "registeredRms": rms,
++        "seedRms": [trial[0] for trial in trials],
++    }
++    Path(args.metadata).write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/experiments/octree-mapping/README.md b/experiments/octree-mapping/README.md
+index 1a771a6..0602eac 100644
+--- a/experiments/octree-mapping/README.md
++++ b/experiments/octree-mapping/README.md
+@@ -74,7 +74,10 @@ is read by candidate generation, costs, support, or Sinkhorn or included in the
+ For the retained Plan 4 transformer validation, `scripts/prepare_mapping_input.py`
+ converts the private GT OBJ, final candidate OBJ, canonical whole STL, and the
+ renderer-retained per-part STL manifest into that same contract. It uses the
+-fixed `[-1, 1]^3` root, verifies whole STL/OBJ frame identity, and applies the
++`[-1, 1]^3` root by default, or the root given by `--root-min x y z --root-side s`
++in mesh units. Cell masses are surface areas in root half-side squared units, so the
++unbalanced transport balance is the same whether the meshes are normalized or kept
++in candidate SCAD millimetres. It verifies whole STL/OBJ frame identity, and applies the
+ single combined-part-bounds-to-final-OBJ uniform transform; it performs no ICP,
+ rotation, or semantic inference. Because the final Boolean union is retriangulated,
+ each final-surface triangle inherits the geometrically nearest retained part-surface
+@@ -84,6 +87,21 @@ generated input remains private because its occupied cells and provenance are
+ reconstructive. The separate metadata file records paths, bounds, counts,
+ transform, time, and peak memory without containing node geometry.
+ 
++When the reference mesh keeps its own arbitrary pose and scale, such as a fixture
++OBJ scaled for a paid retest, run `scripts/register_reference.py` first. It fits
++one similarity transform (uniform scale, proper rotation, translation) of the
++reference onto the candidate with PCA-seeded symmetric nearest-neighbour ICP and
++writes the registered reference STL in candidate coordinates plus a metadata file
++with the transform and before/after symmetric RMS. Reflections are never fitted,
++so a mirrored candidate still appears as residual. Without this step, the mapper
++reports the pose and scale gap between the two frames as surface displacement.
++
++```bash
++.venv/bin/python scripts/register_reference.py \
++  --reference reference.stl --candidate candidate.stl \
++  --output reference-registered.stl --metadata registration.json
++```
++
+ The real-data ablation writes four private reports plus one aggregate summary:
+ 
+ ```bash
+@@ -122,7 +140,10 @@ parts-colour views, legend, and step directory, then returns one Mapping text
+ feedback string. The host adapter is responsible for preparing the current
+ candidate/target octree `input` and `report`, the existing `plan.json` semantic
+ plan, and the front/top/right candidate/comparison images required by
+-`runMappingAgent`.
++`runMappingAgent`. The adapter must keep both meshes in candidate SCAD millimetres
++and pass an octree root in those units: the Mapping Agent treats every `*Mm`
++length, `locationMm`, and the `inspect_mapping_part` radius as SCAD millimetres,
++and the radius cap is eight finest cells of that root.
+ 
+ ```ts
+ import { makeMappingCritic } from "../../src/pipeline/mapping-critic.ts";
