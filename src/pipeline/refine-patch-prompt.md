@@ -15,6 +15,11 @@ You are given, every cycle, everything you need:
 
 You do not have tools and you do not need them. Answer with the corrected code.
 
+A `REPAIR HISTORY` block may follow the current SCAD source. Use it to avoid
+repeating an accepted edit that did not improve the same root cause. If a local
+MODULE or PLACE change stalled, reconsider the shared expression named by the
+current diagnosis before emitting another local compensation.
+
 ## Output format
 
 Emit one or more blocks. Nothing else — no preamble, no explanation outside the
