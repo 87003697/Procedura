@@ -142,37 +142,42 @@ bun run scripts/procedura.ts -o outputs/daybed \
 
 Import STL, OBJ, PLY, GLB, glTF, or 3MF into the private reference store
 then use its rendered reference images and plan for open-loop CAD generation. STL, OBJ, and
-PLY coordinates must already be Z-up millimetres; glTF/GLB use standard Y-up
-metres; 3MF uses its declared unit and defined coordinate transform:
+PLY coordinates must already be Z-up; glTF/GLB use standard Y-up; 3MF uses its
+defined coordinate transform. Before import, Mesh-to-CAD centres the reference
+bounding box at the origin and uniformly scales its longest side to 100 mm
+without rotating it, so source units do not affect the result:
 
 ```bash
 bun run mesh-to-cad --mesh reference.stl -o outputs/reference-cad
 ```
 
 Add `--refine` to keep the same Plan 2 → Plan 3 pipeline but enable its
-whole-model Phase 2: the reference Mesh is rendered from seven named views and
-the generated draft is reviewed and repaired against those public images.
+whole-model Phase 2: the generated draft is reviewed and repaired against the
+same seven public reference views.
 
 ```bash
 bun run mesh-to-cad --mesh reference.stl -o outputs/reference-cad --refine
 ```
 
 Set `PROCEDURA_REFERENCE_ROOT` to a directory outside the Procedura checkout
-and outputs root. By default, Plan 2 renders one public isometric `image.png`;
-programmatic callers may select additional named views from the existing view
-catalog, with the first view remaining authoritative. Plan 2's planner receives
+and outputs root. Plan 2 renders seven public views of the reference: isometric
+as the authoritative `image.png`, plus front, back, left, right, top, and
+bottom; programmatic callers may select a different ordered list from the
+existing view catalog, with the first view remaining authoritative. Plan 2's planner receives
 only those public images and the bounded Z-up/mm geometry summary, and writes
-`plan.json`. Plan 3's incremental generator receives the same public images and
-`plan.json`, then uses the upstream per-part retries, plan reviewer,
+`plan.json`. Plan 3's incremental generator receives the same public images,
+`plan.json`, and a reference-frame block with the centred bounding box, and is
+asked to build the CAD in that frame; it then uses the upstream per-part retries, plan reviewer,
 connectivity gate, and incomplete-draft resume behavior.
 Neither call receives the reference handle, private canonical Mesh, source
 bytes or paths, manifest, materials, textures, or host metadata. The command
-retains `reference.json`, `image.png`, and `plan.json`, and adds `final.scad`
-and `final.obj` on success. Selected supplementary views are retained as
-`image-<view>.png`. Canonical output remains
-geometry-only binary STL in Z-up millimetres; STL/OBJ/PLY retain their
-preconditioned coordinates, while glTF/GLB convert Y-up/metres to
-Z-up/millimetres.
+retains `reference.json`, `reference-normalization.json` (centre offset, scale,
+and dimensions), `image.png`, and `plan.json`, and adds `final.scad`
+and `final.obj` on success. Supplementary views are retained as
+`image-<view>.png`. The private canonical STL, rendered views, and
+`reference.json` dimensions use the normalized frame, and `final.scad` is
+requested in it; the published `final.obj` is still normalized to `[-1, 1]` by
+Procedura, so recompile `final.scad` for millimetre comparisons.
 Without `--refine`, Mesh-to-CAD promotes the Plan 3 draft without the Phase 2 whole-model review. With
 `--refine`, the same unified pipeline uses Procedura's existing direct
 compile/critic/patch/gate loop and writes its normal `_refine_steps/`,
