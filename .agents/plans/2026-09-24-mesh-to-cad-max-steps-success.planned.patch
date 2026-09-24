@@ -1,0 +1,28 @@
+diff --git a/README.md b/README.md
+index 26e0d17..f58a6a3 100644
+--- a/README.md
++++ b/README.md
+@@ -181,7 +181,9 @@ Procedura, so recompile `final.scad` for millimetre comparisons.
+ Without `--refine`, Mesh-to-CAD promotes the Plan 3 draft without the Phase 2 whole-model review. With
+ `--refine`, the same unified pipeline uses Procedura's existing direct
+ compile/critic/patch/gate loop and writes its normal `_refine_steps/`,
+-`preview_final/`, and `final_summary.txt` artifacts. This is image-space review,
++`preview_final/`, and `final_summary.txt` artifacts. Exhausting the refine
++budget (`max-steps`) still succeeds when `final.scad` and `final.obj` are
++complete; other refine verdicts fail the command. This is image-space review,
+ not 3D source-to-generated measurement. The default path has no whole-model
+ refine loop, closed-loop iteration, four-view/brief/scoring workflow,
+ STEP/build123d, or material/texture processing.
+diff --git a/src/pipeline_mesh2code/mesh-to-cad-generation.ts b/src/pipeline_mesh2code/mesh-to-cad-generation.ts
+index 9d41bbe..803aede 100644
+--- a/src/pipeline_mesh2code/mesh-to-cad-generation.ts
++++ b/src/pipeline_mesh2code/mesh-to-cad-generation.ts
+@@ -68,7 +68,7 @@ export async function runMeshToCadGeneration(
+   });
+   const finalScad = resolve(outputDir, "final.scad");
+   const finalObj = resolve(outputDir, "final.obj");
+-  if (!generated.refine.ok) {
++  if (!generated.refine.ok && generated.refine.verdict !== "max-steps") {
+     throw new Error(`Mesh-to-CAD refine ended with verdict: ${generated.refine.verdict}`);
+   }
+   if (!existsSync(finalScad) || !existsSync(finalObj) ||
