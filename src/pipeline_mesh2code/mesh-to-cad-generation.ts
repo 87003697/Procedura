@@ -1,10 +1,7 @@
 import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import {
-  planReferenceRun,
-  type PlanReferenceRunOpts,
-  type PlanReferenceRunResult,
-} from "./mesh-to-cad-plan.ts";
+import type { PlanReferenceRunOpts, PlanReferenceRunResult } from "./mesh-to-cad-plan.ts";
+import { planNormalizedReferenceRun, referenceFrameText } from "./mesh-to-cad-reference-frame.ts";
 import { runMeshToCadProcedura } from "./procedura_adapter.ts";
 import type { MappingCritic } from "../pipeline/mapping-critic.ts";
 import type { ViewName } from "../render/views.ts";
@@ -20,7 +17,7 @@ const STALE_DIRS = [
   "preview_final", "preview_painted", "preview_ao", "preview_ao_ortho",
   "preview_final.tmp", "_final_build", "_refine_steps", "motion",
 ];
-const REFINE_REFERENCE_VIEWS = [
+const REFERENCE_VIEWS = [
   "isometric", "front", "back", "left", "right", "top", "bottom",
 ] as const satisfies readonly ViewName[];
 
@@ -45,9 +42,9 @@ export async function runMeshToCadGeneration(
     existsSync(join(outputDir, "draft.scad"));
   for (const file of STALE_FILES) rmSync(resolve(outputDir, file), { force: true });
   for (const dir of STALE_DIRS) rmSync(resolve(outputDir, dir), { recursive: true, force: true });
-  const planned = await planReferenceRun({
+  const planned = await planNormalizedReferenceRun({
     ...planOpts,
-    ...(refine ? { referenceViews: REFINE_REFERENCE_VIEWS } : {}),
+    referenceViews: planOpts.referenceViews ?? REFERENCE_VIEWS,
     ...(reuseDraftPlan ? { reuseExistingPlan: true } : {}),
     maxParts: 0,
   });
@@ -61,6 +58,7 @@ export async function runMeshToCadGeneration(
     outputDir: planned.outputDir,
     planPath,
     planText,
+    referenceFrame: referenceFrameText(planned.summary.dimensions),
     referenceImages: planned.referenceImages.map((image) => ({
       label: image.view,
       path: image.path,

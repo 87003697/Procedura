@@ -6,6 +6,7 @@ export interface MeshToCadProceduraOpts {
   outputDir: string;
   planPath: string;
   planText: string;
+  referenceFrame: string;
   referenceImages: readonly { label: string; path: string }[];
   refine: boolean;
   mappingCritic?: MappingCritic;
@@ -22,7 +23,7 @@ export function runMeshToCadProcedura(
   opts: MeshToCadProceduraOpts,
 ): Promise<RunProceduraResult> {
   return runProcedura({
-    text: "Generate editable CAD from this host-produced plan:\n\n" + opts.planText,
+    text: "Generate editable CAD from this host-produced plan:\n\n" + opts.planText + "\n\n" + opts.referenceFrame,
     outputDir: opts.outputDir,
     incremental: true,
     contextRenders: true,

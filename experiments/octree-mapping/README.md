@@ -143,7 +143,12 @@ plan, and the front/top/right candidate/comparison images required by
 `runMappingAgent`. The adapter must keep both meshes in candidate SCAD millimetres
 and pass an octree root in those units: the Mapping Agent treats every `*Mm`
 length, `locationMm`, and the `inspect_mapping_part` radius as SCAD millimetres,
-and the radius cap is eight finest cells of that root.
+and the radius cap is eight finest cells of that root. For Mesh-to-CAD runs,
+convert the target to STL with `normalizeReference` from
+`src/reference/normalization.ts`, then normalize that copy with
+`normalizeReferenceStl` from `src/pipeline_mesh2code/mesh-to-cad-reference-frame.ts`;
+it reproduces the transform in `reference-normalization.json`, so the target
+shares the frame the draft was built in and needs no registration.
 
 ```ts
 import { makeMappingCritic } from "../../src/pipeline/mapping-critic.ts";
