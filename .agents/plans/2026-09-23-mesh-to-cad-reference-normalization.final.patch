@@ -1,0 +1,239 @@
+diff --git a/src/pipeline_mesh2code/mesh-to-cad-reference-frame.ts b/src/pipeline_mesh2code/mesh-to-cad-reference-frame.ts
+new file mode 100644
+index 0000000..0cf557b
+--- /dev/null
++++ b/src/pipeline_mesh2code/mesh-to-cad-reference-frame.ts
+@@ -0,0 +1,86 @@
++import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
++import { dirname, join, resolve } from "node:path";
++
++import { normalizeMeshInPlace } from "../mesh/normalize.ts";
++import { ReferenceAuthority, formatOf } from "../reference/authority.ts";
++import { normalizeReference } from "../reference/normalization.ts";
++import {
++  planReferenceRun,
++  type PlanReferenceRunOpts,
++  type PlanReferenceRunResult,
++} from "./mesh-to-cad-plan.ts";
++
++const PROCEDURA_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..", "..");
++// The [-1, 1]^3 cube scaled by 50: the draft facet policy ($fs = 1) and prompt
++// tolerances such as 0.5 mm overlaps assume millimetre-sized models.
++const REFERENCE_LONGEST_SIDE_MM = 100;
++
++/** Maps canonical Z-up millimetre coordinates into the Mesh-to-CAD frame as (source + centerOffset) * scale. */
++export interface ReferenceNormalization {
++  schemaVersion: 1;
++  centerOffset: [number, number, number];
++  scale: number;
++  sourceDimensions: [number, number, number];
++  dimensions: [number, number, number];
++}
++
++/** Center an STL's bounding box at the origin and scale its longest side to 100 mm, in place, without rotation. */
++export function normalizeReferenceStl(stlPath: string): ReferenceNormalization {
++  const result = normalizeMeshInPlace({ stlPath, targetHalfExtent: REFERENCE_LONGEST_SIDE_MM / 2 });
++  return {
++    schemaVersion: 1,
++    centerOffset: result.center_offset,
++    scale: result.scale,
++    sourceDimensions: result.bbox_before_size,
++    dimensions: result.bbox_after_size,
++  };
++}
++
++/**
++ * Plan a Mesh-to-CAD run from a normalized copy of the reference mesh.
++ *
++ * The copy is staged inside the private reference root and removed after the
++ * reference store imports it; the transform is kept in the run directory as
++ * reference-normalization.json.
++ */
++export async function planNormalizedReferenceRun(opts: PlanReferenceRunOpts): Promise<PlanReferenceRunResult> {
++  const runsRoot = resolve(
++    opts.runsRoot ?? process.env["PROCEDURA_OUTPUTS_ROOT"] ?? join(PROCEDURA_ROOT, "outputs"),
++  );
++  const configuredRoot = opts.referenceRoot ?? process.env["PROCEDURA_REFERENCE_ROOT"];
++  if (!configuredRoot) throw new Error("Mesh-to-CAD requires --reference-root or PROCEDURA_REFERENCE_ROOT");
++  const referenceRoot = resolve(configuredRoot);
++  // Rejects a root that overlaps runs or the workspace before the copy is written into it.
++  new ReferenceAuthority(referenceRoot, [runsRoot, PROCEDURA_ROOT]);
++  const source = resolve(opts.meshPath);
++  if (!existsSync(source)) throw new Error("reference mesh not found: " + source);
++  const format = formatOf(source);
++  mkdirSync(referenceRoot, { recursive: true });
++  const stagingDir = mkdtempSync(join(referenceRoot, ".normalize-"));
++  try {
++    const meshPath = join(stagingDir, "reference.stl");
++    await normalizeReference(source, format, meshPath);
++    const normalization = normalizeReferenceStl(meshPath);
++    const planned = await planReferenceRun({ ...opts, meshPath });
++    writeFileSync(
++      join(planned.outputDir, "reference-normalization.json"),
++      JSON.stringify(normalization, null, 2) + "\n",
++      "utf8",
++    );
++    return planned;
++  } finally {
++    rmSync(stagingDir, { recursive: true, force: true });
++  }
++}
++
++/** Describe the normalized reference frame for every draft request. */
++export function referenceFrameText(dimensions: [number, number, number]): string {
++  const [x, y, z] = dimensions;
++  return "=== REFERENCE FRAME ===\n" +
++    "Z-up millimetres. The reference object's axis-aligned bounding box is centred at the origin " +
++    `and measures ${x.toFixed(2)} × ${y.toFixed(2)} × ${z.toFixed(2)} mm ` +
++    `(X ±${(x / 2).toFixed(2)}, Y ±${(y / 2).toFixed(2)}, Z ±${(z / 2).toFixed(2)}). ` +
++    "Build the assembled model at this scale and position so its overall bounding box matches on " +
++    "every axis. The origin is the centre of the whole object, not of the root part: place every " +
++    "part, including the first, at its own position inside this box.";
++}
+diff --git a/src/pipeline_mesh2code/mesh-to-cad-generation.ts b/src/pipeline_mesh2code/mesh-to-cad-generation.ts
+index e709705..9d41bbe 100644
+--- a/src/pipeline_mesh2code/mesh-to-cad-generation.ts
++++ b/src/pipeline_mesh2code/mesh-to-cad-generation.ts
+@@ -1,10 +1,7 @@
+ import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
+ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+-import {
+-  planReferenceRun,
+-  type PlanReferenceRunOpts,
+-  type PlanReferenceRunResult,
+-} from "./mesh-to-cad-plan.ts";
++import type { PlanReferenceRunOpts, PlanReferenceRunResult } from "./mesh-to-cad-plan.ts";
++import { planNormalizedReferenceRun, referenceFrameText } from "./mesh-to-cad-reference-frame.ts";
+ import { runMeshToCadProcedura } from "./procedura_adapter.ts";
+ import type { MappingCritic } from "../pipeline/mapping-critic.ts";
+ import type { ViewName } from "../render/views.ts";
+@@ -20,7 +17,7 @@ const STALE_DIRS = [
+   "preview_final", "preview_painted", "preview_ao", "preview_ao_ortho",
+   "preview_final.tmp", "_final_build", "_refine_steps", "motion",
+ ];
+-const REFINE_REFERENCE_VIEWS = [
++const REFERENCE_VIEWS = [
+   "isometric", "front", "back", "left", "right", "top", "bottom",
+ ] as const satisfies readonly ViewName[];
+ 
+@@ -45,9 +42,9 @@ export async function runMeshToCadGeneration(
+     existsSync(join(outputDir, "draft.scad"));
+   for (const file of STALE_FILES) rmSync(resolve(outputDir, file), { force: true });
+   for (const dir of STALE_DIRS) rmSync(resolve(outputDir, dir), { recursive: true, force: true });
+-  const planned = await planReferenceRun({
++  const planned = await planNormalizedReferenceRun({
+     ...planOpts,
+-    ...(refine ? { referenceViews: REFINE_REFERENCE_VIEWS } : {}),
++    referenceViews: planOpts.referenceViews ?? REFERENCE_VIEWS,
+     ...(reuseDraftPlan ? { reuseExistingPlan: true } : {}),
+     maxParts: 0,
+   });
+@@ -61,6 +58,7 @@ export async function runMeshToCadGeneration(
+     outputDir: planned.outputDir,
+     planPath,
+     planText,
++    referenceFrame: referenceFrameText(planned.summary.dimensions),
+     referenceImages: planned.referenceImages.map((image) => ({
+       label: image.view,
+       path: image.path,
+diff --git a/src/pipeline_mesh2code/procedura_adapter.ts b/src/pipeline_mesh2code/procedura_adapter.ts
+index 623b893..c578f49 100644
+--- a/src/pipeline_mesh2code/procedura_adapter.ts
++++ b/src/pipeline_mesh2code/procedura_adapter.ts
+@@ -6,6 +6,7 @@ export interface MeshToCadProceduraOpts {
+   outputDir: string;
+   planPath: string;
+   planText: string;
++  referenceFrame: string;
+   referenceImages: readonly { label: string; path: string }[];
+   refine: boolean;
+   mappingCritic?: MappingCritic;
+@@ -22,7 +23,7 @@ export function runMeshToCadProcedura(
+   opts: MeshToCadProceduraOpts,
+ ): Promise<RunProceduraResult> {
+   return runProcedura({
+-    text: "Generate editable CAD from this host-produced plan:\n\n" + opts.planText,
++    text: "Generate editable CAD from this host-produced plan:\n\n" + opts.planText + "\n\n" + opts.referenceFrame,
+     outputDir: opts.outputDir,
+     incremental: true,
+     contextRenders: true,
+diff --git a/README.md b/README.md
+index 8196fa9..26e0d17 100644
+--- a/README.md
++++ b/README.md
+@@ -142,37 +142,42 @@ bun run scripts/procedura.ts -o outputs/daybed \
+ 
+ Import STL, OBJ, PLY, GLB, glTF, or 3MF into the private reference store
+ then use its rendered reference images and plan for open-loop CAD generation. STL, OBJ, and
+-PLY coordinates must already be Z-up millimetres; glTF/GLB use standard Y-up
+-metres; 3MF uses its declared unit and defined coordinate transform:
++PLY coordinates must already be Z-up; glTF/GLB use standard Y-up; 3MF uses its
++defined coordinate transform. Before import, Mesh-to-CAD centres the reference
++bounding box at the origin and uniformly scales its longest side to 100 mm
++without rotating it, so source units do not affect the result:
+ 
+ ```bash
+ bun run mesh-to-cad --mesh reference.stl -o outputs/reference-cad
+ ```
+ 
+ Add `--refine` to keep the same Plan 2 → Plan 3 pipeline but enable its
+-whole-model Phase 2: the reference Mesh is rendered from seven named views and
+-the generated draft is reviewed and repaired against those public images.
++whole-model Phase 2: the generated draft is reviewed and repaired against the
++same seven public reference views.
+ 
+ ```bash
+ bun run mesh-to-cad --mesh reference.stl -o outputs/reference-cad --refine
+ ```
+ 
+ Set `PROCEDURA_REFERENCE_ROOT` to a directory outside the Procedura checkout
+-and outputs root. By default, Plan 2 renders one public isometric `image.png`;
+-programmatic callers may select additional named views from the existing view
+-catalog, with the first view remaining authoritative. Plan 2's planner receives
++and outputs root. Plan 2 renders seven public views of the reference: isometric
++as the authoritative `image.png`, plus front, back, left, right, top, and
++bottom; programmatic callers may select a different ordered list from the
++existing view catalog, with the first view remaining authoritative. Plan 2's planner receives
+ only those public images and the bounded Z-up/mm geometry summary, and writes
+-`plan.json`. Plan 3's incremental generator receives the same public images and
+-`plan.json`, then uses the upstream per-part retries, plan reviewer,
++`plan.json`. Plan 3's incremental generator receives the same public images,
++`plan.json`, and a reference-frame block with the centred bounding box, and is
++asked to build the CAD in that frame; it then uses the upstream per-part retries, plan reviewer,
+ connectivity gate, and incomplete-draft resume behavior.
+ Neither call receives the reference handle, private canonical Mesh, source
+ bytes or paths, manifest, materials, textures, or host metadata. The command
+-retains `reference.json`, `image.png`, and `plan.json`, and adds `final.scad`
+-and `final.obj` on success. Selected supplementary views are retained as
+-`image-<view>.png`. Canonical output remains
+-geometry-only binary STL in Z-up millimetres; STL/OBJ/PLY retain their
+-preconditioned coordinates, while glTF/GLB convert Y-up/metres to
+-Z-up/millimetres.
++retains `reference.json`, `reference-normalization.json` (centre offset, scale,
++and dimensions), `image.png`, and `plan.json`, and adds `final.scad`
++and `final.obj` on success. Supplementary views are retained as
++`image-<view>.png`. The private canonical STL, rendered views, and
++`reference.json` dimensions use the normalized frame, and `final.scad` is
++requested in it; the published `final.obj` is still normalized to `[-1, 1]` by
++Procedura, so recompile `final.scad` for millimetre comparisons.
+ Without `--refine`, Mesh-to-CAD promotes the Plan 3 draft without the Phase 2 whole-model review. With
+ `--refine`, the same unified pipeline uses Procedura's existing direct
+ compile/critic/patch/gate loop and writes its normal `_refine_steps/`,
+diff --git a/experiments/octree-mapping/README.md b/experiments/octree-mapping/README.md
+index 0602eac..491fb9c 100644
+--- a/experiments/octree-mapping/README.md
++++ b/experiments/octree-mapping/README.md
+@@ -143,7 +143,12 @@ plan, and the front/top/right candidate/comparison images required by
+ `runMappingAgent`. The adapter must keep both meshes in candidate SCAD millimetres
+ and pass an octree root in those units: the Mapping Agent treats every `*Mm`
+ length, `locationMm`, and the `inspect_mapping_part` radius as SCAD millimetres,
+-and the radius cap is eight finest cells of that root.
++and the radius cap is eight finest cells of that root. For Mesh-to-CAD runs,
++convert the target to STL with `normalizeReference` from
++`src/reference/normalization.ts`, then normalize that copy with
++`normalizeReferenceStl` from `src/pipeline_mesh2code/mesh-to-cad-reference-frame.ts`;
++it reproduces the transform in `reference-normalization.json`, so the target
++shares the frame the draft was built in and needs no registration.
+ 
+ ```ts
+ import { makeMappingCritic } from "../../src/pipeline/mapping-critic.ts";
