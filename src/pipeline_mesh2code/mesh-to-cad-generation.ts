@@ -68,7 +68,7 @@ export async function runMeshToCadGeneration(
   });
   const finalScad = resolve(outputDir, "final.scad");
   const finalObj = resolve(outputDir, "final.obj");
-  if (!generated.refine.ok) {
+  if (!generated.refine.ok && generated.refine.verdict !== "max-steps") {
     throw new Error(`Mesh-to-CAD refine ended with verdict: ${generated.refine.verdict}`);
   }
   if (!existsSync(finalScad) || !existsSync(finalObj) ||
