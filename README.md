@@ -181,7 +181,9 @@ Procedura, so recompile `final.scad` for millimetre comparisons.
 Without `--refine`, Mesh-to-CAD promotes the Plan 3 draft without the Phase 2 whole-model review. With
 `--refine`, the same unified pipeline uses Procedura's existing direct
 compile/critic/patch/gate loop and writes its normal `_refine_steps/`,
-`preview_final/`, and `final_summary.txt` artifacts. This is image-space review,
+`preview_final/`, and `final_summary.txt` artifacts. Exhausting the refine
+budget (`max-steps`) still succeeds when `final.scad` and `final.obj` are
+complete; other refine verdicts fail the command. This is image-space review,
 not 3D source-to-generated measurement. The default path has no whole-model
 refine loop, closed-loop iteration, four-view/brief/scoring workflow,
 STEP/build123d, or material/texture processing.
