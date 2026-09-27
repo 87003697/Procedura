@@ -1,0 +1,48 @@
+diff --git a/src/pipeline/refine-direct.ts b/src/pipeline/refine-direct.ts
+index 53056d6..75c36ba 100644
+--- a/src/pipeline/refine-direct.ts
++++ b/src/pipeline/refine-direct.ts
+@@ -332,6 +332,8 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
+   let builtStl: string | null = null;
+   /** Consecutive cycles that accepted nothing. */
+   let barren = 0;
++  /** A patch call failed within the current run of barren cycles. */
++  let barrenCallFailed = false;
+   let verdict: RefineResult["verdict"] = "max-steps";
+   let summary = "(no summary)";
+   let accepted = 0;
+@@ -447,6 +449,7 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
+       if (mappingResult?.reasoning) writeFileSync(join(stepDir, "mapping_thinking.txt"), mappingResult.reasoning, "utf8");
+       if (mappingDiagnosis) writeFileSync(join(stepDir, "mapping.txt"), mappingDiagnosis, "utf8");
+     } catch (e) {
++      verdict = opts.signal?.aborted ? "aborted" : "error";
+       log(`  critic failed: ${(e as Error).message.slice(0, 200)} — ending refine`);
+       break;
+     }
+@@ -553,6 +556,7 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
+         writeFileSync(join(stepDir, `patch_response_${attempt}.txt`), raw, "utf8");
+         if (r.reasoning) writeFileSync(join(stepDir, `patch_thinking_${attempt}.txt`), r.reasoning, "utf8");
+       } catch (e) {
++        barrenCallFailed = true;
+         repairNote = (e as Error).message.slice(0, 1200);
+         rememberRepair(compactHistoryField(
+           `cycle ${cycle}: rejected (llm); reason ${repairNote}; residual ${mappingDiagnosis || measurements}`,
+@@ -670,7 +674,7 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
+       break;
+     }
+ 
+-    if (landed) barren = 0;
++    if (landed) { barren = 0; barrenCallFailed = false; }
+     if (!landed && verdict !== "ok") {
+       barren += 1;
+       log(`  cycle ${cycle} produced no accepted edit (${barren} in a row)`);
+@@ -683,6 +687,9 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
+         // budget unspent, which is strictly better than spending it here.
+         log(`  ${barren} consecutive cycles accepted nothing — stopping rather than ` +
+             `re-deriving a patch that has already been refused`);
++        if (opts.signal?.aborted) verdict = "aborted";
++        else if (barrenCallFailed) verdict = "error";
++        else verdict = "max-steps";
+         break;
+       }
+     }
