@@ -440,7 +440,7 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
       visualActionable = hasDiagnosisIssues(visualDiagnosis);
       mappingActionable = hasDiagnosisIssues(mappingDiagnosis);
       diagnosis = mappingDiagnosis
-        ? "=== VISUAL CRITIC ===\n" + visualDiagnosis + "\n\n=== MAPPING CRITIC ===\n" + mappingDiagnosis
+        ? "=== MAPPING CRITIC ===\n" + mappingDiagnosis + "\n\n=== VISUAL CRITIC ===\n" + visualDiagnosis
         : visualDiagnosis;
       writeFileSync(join(stepDir, "diagnosis.txt"), diagnosis, "utf8");
       if (visualResult.reasoning) writeFileSync(join(stepDir, "diagnose_thinking.txt"), visualResult.reasoning, "utf8");
@@ -451,7 +451,8 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
       break;
     }
 
-    const summaryLine = visualDiagnosis.split("\n").find((l) => /^\s*summary:/i.test(l)) ?? visualDiagnosis.slice(0, 120);
+    const summarySource = mappingDiagnosis || visualDiagnosis;
+    const summaryLine = summarySource.split("\n").find((l) => /^\s*summary:/i.test(l)) ?? summarySource.slice(0, 120);
     summary = summaryLine.replace(/^\s*summary:\s*/i, "").trim();
     state.diagnosisHistory.push({ cycle, summary, raw: diagnosis });
     log(`  critic: ${summary.slice(0, 160)}`);
