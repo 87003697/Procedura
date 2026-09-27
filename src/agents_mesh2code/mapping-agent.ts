@@ -22,6 +22,8 @@ const SYSTEM = [
   "Use [HIGH] for a supported wrong placement, wrong orientation, or disconnected region that materially affects the model; use [MED] for a smaller but actionable localized residual; use [LOW] only for a minor residual that should not drive a repair by itself. Severity labels the issue, while issue order determines repair priority. Every issue must name the candidate module(s) from the semantic plan and preserve the candidate→GT sign convention in FIX. Do not claim unsupported source-code locations, raw mesh, or pass/fail authority. Do not name a shared parameter unless the complete SCAD source visibly supports that dependency.",
 ].join(" ");
 const client = createLLMClient({ fetch: longTimeoutFetch, maxAttempts: 1 });
+/** Model turns per Mapping call; each cycle of the 09-24 eight-cycle run used at most two. */
+const MAX_MAPPING_TURNS = 6;
 
 function parseSemanticPlan(value: unknown): JsonObject[] {
   if (!Array.isArray(value)) throw Error("semantic plan must be a plan.json array");
@@ -35,13 +37,7 @@ function parseSemanticPlan(value: unknown): JsonObject[] {
   });
 }
 
-function validatePlanCoverage(partIds: Set<string>, plan: JsonObject[]): void {
-  const names = new Set(plan.map((entry) => String(entry.name)));
-  const missing = [...partIds].find((partId) => !names.has(partId));
-  if (missing) throw Error(`mapping partId not found in plan.json: ${missing}`);
-}
-
-function parseToolCalls(events: LLMEvent[]): { text: string; reasoning: string; calls: Array<{ id: string; name: string; input: JsonObject }> } {
+function parseToolCalls(events: LLMEvent[]): { text: string; reasoning: string; calls: Array<{ id: string; name: string; input: JsonObject; argsError?: string }> } {
   const text = events.filter((event) => event.kind === "text-delta").map((event) => event.text).join("");
   const reasoning = events.filter((event) => event.kind === "thinking-delta").map((event) => event.text).join("");
   const pending = new Map<string, { name: string; args: string; input?: JsonObject }>();
@@ -49,15 +45,23 @@ function parseToolCalls(events: LLMEvent[]): { text: string; reasoning: string; 
     if (event.kind === "tool-call-start") pending.set(event.toolCallId, { name: event.toolName, args: "" });
     else if (event.kind === "tool-call-delta") pending.get(event.toolCallId)!.args += event.argDelta;
     else if (event.kind === "tool-call-finish") pending.set(event.toolCallId, { name: pending.get(event.toolCallId)?.name ?? "inspect_mapping_part", args: JSON.stringify(event.input), input: event.input });
+    else if (event.kind === "error") throw event.error;
   }
+  // Unparseable arguments may come from the model, a length cut, or a dropped stream chunk; re-asking is bounded by MAX_MAPPING_TURNS.
   return {
     text,
     reasoning,
-    calls: [...pending].map(([id, call]) => ({
-      id,
-      name: call.name,
-      input: call.input ?? JSON.parse(call.args || "{}") as JsonObject,
-    })),
+    calls: [...pending].map(([id, call]) => {
+      if (call.input) {
+        return { id, name: call.name, input: call.input };
+      } else {
+        try {
+          return { id, name: call.name, input: JSON.parse(call.args || "{}") as JsonObject };
+        } catch (error) {
+          return { id, name: call.name, input: {}, argsError: `tool-call arguments are not valid JSON: ${(error as Error).message}` };
+        }
+      }
+    }),
   };
 }
 
@@ -65,7 +69,7 @@ async function generateMappingResponse(args: { route: RouteDef<unknown>; model: 
   resetMappingEvidenceExposure(args.evidence);
   let messages: CanonicalMessage[] = [{ role: "user", content: [{ kind: "text", text: JSON.stringify(args.facts) }, ...args.visionParts] }];
   let reasoning = "";
-  for (;;) {
+  for (let turn = 1; turn <= MAX_MAPPING_TURNS; turn++) {
     const request: CanonicalRequest = {
       model: args.model,
       system: [{ text: args.system }],
@@ -80,6 +84,7 @@ async function generateMappingResponse(args: { route: RouteDef<unknown>; model: 
     reasoning += parsed.reasoning;
     if (parsed.calls.length === 0) {
       const split = splitThinkTags(parsed.text);
+      if (!split.text.trim()) throw Error("mapping agent returned no diagnosis text");
       return {
         text: split.text,
         reasoning: reasoning + (split.think ? (reasoning ? "\n\n" : "") + split.think : ""),
@@ -92,6 +97,7 @@ async function generateMappingResponse(args: { route: RouteDef<unknown>; model: 
     const toolResults: CanonicalPart[] = [];
     for (const call of parsed.calls) {
       try {
+        if (call.argsError) throw Error(call.argsError);
         if (call.name !== args.inspectTool.descriptor.name) throw Error(`unknown mapping tool: ${call.name}`);
         const result = await args.inspectTool.execute(call.input, {} as never);
         if (!result.ok) throw Error(result.error);
@@ -102,7 +108,7 @@ async function generateMappingResponse(args: { route: RouteDef<unknown>; model: 
     }
     messages = [...messages, { role: "tool", content: toolResults }];
   }
-  throw Error("mapping inspection loop ended without a final response");
+  throw Error(`mapping agent gave no final diagnosis within ${MAX_MAPPING_TURNS} turns`);
 }
 
 async function readCells(source: MappingFactsSource): Promise<JsonObject[]> {
@@ -122,14 +128,18 @@ async function readCells(source: MappingFactsSource): Promise<JsonObject[]> {
 export async function runMappingAgent(args: { source: MappingFactsSource; semanticPlan: unknown; vision: MappingVisionInput; route: RouteDef<unknown>; model: ModelRef; signal?: AbortSignal }): Promise<GenerateResult> {
   const semanticPlan = parseSemanticPlan(args.semanticPlan);
   const evidence = buildMappingEvidence(await readCells(args.source));
-  validatePlanCoverage(evidence.partIds, semanticPlan);
+  // Modules added during refine have no plan entry; list them so issues can still name them.
+  const plannedNames = new Set(semanticPlan.map((entry) => String(entry.name)));
+  const unplanned = [...evidence.partIds]
+    .filter((partId) => !plannedNames.has(partId))
+    .map((partId): JsonObject => ({ name: partId, description: "Added during refine; not in the original semantic plan." }));
   const input = args.source.input as JsonObject;
   // Cap local inspection at eight finest octree cells.
   const frame = input.frame as JsonObject;
   const inspectTool = makeInspectMappingPartTool(evidence, 8 * Number(frame.sideMm) / 2 ** Number(frame.maxDepth));
   const facts: JsonObject = {
     mappingFrame: input.frame ?? null,
-    semanticPlan,
+    semanticPlan: [...semanticPlan, ...unplanned],
     partEvidence: evidence.parts,
   };
   const visionParts = await buildMappingVisionParts(args.vision);

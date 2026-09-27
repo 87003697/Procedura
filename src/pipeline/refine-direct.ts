@@ -332,8 +332,6 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
   let builtStl: string | null = null;
   /** Consecutive cycles that accepted nothing. */
   let barren = 0;
-  /** A patch call failed within the current run of barren cycles. */
-  let barrenCallFailed = false;
   let verdict: RefineResult["verdict"] = "max-steps";
   let summary = "(no summary)";
   let accepted = 0;
@@ -556,13 +554,11 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
         writeFileSync(join(stepDir, `patch_response_${attempt}.txt`), raw, "utf8");
         if (r.reasoning) writeFileSync(join(stepDir, `patch_thinking_${attempt}.txt`), r.reasoning, "utf8");
       } catch (e) {
-        barrenCallFailed = true;
-        repairNote = (e as Error).message.slice(0, 1200);
-        rememberRepair(compactHistoryField(
-          `cycle ${cycle}: rejected (llm); reason ${repairNote}; residual ${mappingDiagnosis || measurements}`,
-          900,
-        ));
-        log(`  patch call failed: ${repairNote.slice(0, 160)}`);
+        // generateWithRetry has already retried this call; a new cycle would
+        // re-bill the critic only to reach the same failing call.
+        verdict = opts.signal?.aborted ? "aborted" : "error";
+        log(`  patch call failed: ${(e as Error).message.slice(0, 200)} — ending refine`);
+        cycle = maxCycles;
         break;
       }
 
@@ -674,8 +670,8 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
       break;
     }
 
-    if (landed) { barren = 0; barrenCallFailed = false; }
-    if (!landed && verdict !== "ok") {
+    if (landed) barren = 0;
+    if (!landed && verdict === "max-steps") {
       barren += 1;
       log(`  cycle ${cycle} produced no accepted edit (${barren} in a row)`);
       writeFileSync(join(stepDir, "summary.json"), JSON.stringify({
@@ -687,9 +683,7 @@ export async function runDirectRefine(opts: DirectRefineOpts): Promise<RefineRes
         // budget unspent, which is strictly better than spending it here.
         log(`  ${barren} consecutive cycles accepted nothing — stopping rather than ` +
             `re-deriving a patch that has already been refused`);
-        if (opts.signal?.aborted) verdict = "aborted";
-        else if (barrenCallFailed) verdict = "error";
-        else verdict = "max-steps";
+        verdict = opts.signal?.aborted ? "aborted" : "max-steps";
         break;
       }
     }
