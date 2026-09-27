@@ -6,9 +6,9 @@ candidate occupied octree cells in their already-shared absolute frame?
 
 The mapping CLI does not read raw meshes, compile OpenSCAD, call an LLM, change
 a model, or participate in Procedura's draft/refine lifecycle. Its inputs are
-private leaf-cell documents prepared by a trusted host. The optional Plan 4
-preparation script below is that trusted host for one retained local run and is
-not registered with Procedura. Outputs contain reconstructive cell data and
+private leaf-cell documents prepared by a trusted host. The preparation script
+below is that trusted host; Mesh-to-CAD's `--mapping` adapter runs it once per
+refine cycle. Outputs contain reconstructive cell data and
 must remain private; they are not an Agent prompt or public run artifact.
 
 ## Layout
@@ -143,32 +143,23 @@ plan, and the front/top/right candidate/comparison images required by
 `runMappingAgent`. The adapter must keep both meshes in candidate SCAD millimetres
 and pass an octree root in those units: the Mapping Agent treats every `*Mm`
 length, `locationMm`, and the `inspect_mapping_part` radius as SCAD millimetres,
-and the radius cap is eight finest cells of that root. For Mesh-to-CAD runs,
-convert the target to STL with `normalizeReference` from
-`src/reference/normalization.ts`, then normalize that copy with
-`normalizeReferenceStl` from `src/pipeline_mesh2code/mesh-to-cad-reference-frame.ts`;
-it reproduces the transform in `reference-normalization.json`, so the target
-shares the frame the draft was built in and needs no registration.
-
-```ts
-import { makeMappingCritic } from "../../src/pipeline/mapping-critic.ts";
-
-const mappingCritic = makeMappingCritic(async (context) => {
-  const current = await prepareCurrentMappingInput(context);
-  return {
-    source: current.source,
-    semanticPlan: current.semanticPlan,
-    vision: current.vision,
-  };
-});
-```
-
-Pass that callback through the Mesh-to-CAD host or `runProcedura`. Each cycle must
+and the radius cap is eight finest cells of that root. Mesh-to-CAD's `--mapping`
+flag uses `src/pipeline_mesh2code/mesh-to-cad-mapping.ts` as this adapter: its
+target is the private canonical reference, which is already in the normalized
+frame the draft was built in and needs no registration, and every Mapping file
+stays in that reference's private workspace. Other hosts pass a
+`makeMappingCritic` callback to `runProcedura`. Each cycle must
 prepare the Mapping source from the `context.stlPath` for that cycle. The Mapping
 Agent returns the same plain-text diagnosis shape as the visual critic:
 `SUMMARY`, `ISSUES`, a severity tag, `[modules: ...]`, and a `FIX:` direction.
 The Mapping issue keeps its evidence-grounded candidate→GT axis correction inside
-the problem and fix text. Its input schema, bounded facts, plan coverage, and
-optional inspection-tool argument checks remain inside the Mapping path. The
+the problem and fix text. Its input schema, bounded facts, and optional
+inspection-tool argument checks remain inside the Mapping path; candidate parts
+missing from `plan.json`, such as modules added during refine, are appended to
+the semantic plan as unplanned entries. The Agent throws on its own model-call
+failures, an empty diagnosis, or no final diagnosis within six model turns,
+which ends refine with verdict `error`. Unparseable tool-call arguments, whether
+from the model, a length cut, or a dropped stream chunk, are returned to the
+model as a tool error, bounded by the same turn limit. The
 refine path does not parse a Mapping JSON artifact. Without a Mapping critic,
 ordinary visual direct refine is unchanged.

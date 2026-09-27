@@ -6,6 +6,7 @@ interface Args {
   referenceRoot?: string;
   runsRoot?: string;
   refine: boolean;
+  mapping: boolean;
 }
 
 function help(): never {
@@ -20,13 +21,14 @@ Options:
   --reference-root PATH       private store root (or PROCEDURA_REFERENCE_ROOT)
   --runs-root PATH            Studio runs root (or PROCEDURA_OUTPUTS_ROOT)
   --refine                    refine the generated draft against seven reference views
+  --mapping                   add the octree Mapping critic to --refine (needs experiments/octree-mapping/.venv)
   -o, --output PATH           output run directory
 `);
   process.exit(0);
 }
 
 function parse(argv: string[]): Args {
-  const args: Args = { outputDir: "", meshPath: "", refine: false };
+  const args: Args = { outputDir: "", meshPath: "", refine: false, mapping: false };
   for (let i = 0; i < argv.length; i++) {
     const value = argv[i]!;
     if (value === "-o" || value === "--output") args.outputDir = argv[++i]!;
@@ -34,6 +36,7 @@ function parse(argv: string[]): Args {
     else if (value === "--reference-root") args.referenceRoot = argv[++i]!;
     else if (value === "--runs-root") args.runsRoot = argv[++i]!;
     else if (value === "--refine") args.refine = true;
+    else if (value === "--mapping") args.mapping = true;
     else if (value === "-h" || value === "--help") help();
     else throw new Error(`unknown flag: ${value}`);
   }
@@ -50,6 +53,7 @@ const result = await runMeshToCadGeneration({
   ...(args.referenceRoot ? { referenceRoot: args.referenceRoot } : {}),
   ...(args.runsRoot ? { runsRoot: args.runsRoot } : {}),
   ...(args.refine ? { refine: true } : {}),
+  ...(args.mapping ? { mapping: true } : {}),
 });
 console.log(`reference: ${result.reference.handle}`);
 console.log(`dimensions: ${result.summary.dimensions.join(" × ")} ${result.summary.units}`);

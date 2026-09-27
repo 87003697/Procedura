@@ -1,9 +1,10 @@
 import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { PlanReferenceRunOpts, PlanReferenceRunResult } from "./mesh-to-cad-plan.ts";
+import { checkMappingEnvironment, makeMeshToCadMappingCritic } from "./mesh-to-cad-mapping.ts";
 import { planNormalizedReferenceRun, referenceFrameText } from "./mesh-to-cad-reference-frame.ts";
 import { runMeshToCadProcedura } from "./procedura_adapter.ts";
-import type { MappingCritic } from "../pipeline/mapping-critic.ts";
+import { ReferenceAuthority } from "../reference/authority.ts";
 import type { ViewName } from "../render/views.ts";
 
 const PROCEDURA_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..", "..");
@@ -27,9 +28,10 @@ function isInside(path: string, root: string): boolean {
 }
 
 export async function runMeshToCadGeneration(
-  opts: PlanReferenceRunOpts & { refine?: boolean; mappingCritic?: MappingCritic },
+  opts: PlanReferenceRunOpts & { refine?: boolean; mapping?: boolean },
 ): Promise<PlanReferenceRunResult> {
-  const { refine = false, mappingCritic, ...planOpts } = opts;
+  const { refine = false, mapping = false, ...planOpts } = opts;
+  if (mapping && !refine) throw new Error("Mesh-to-CAD Mapping requires refine");
   const outputDir = resolve(opts.outputDir);
   if (existsSync(outputDir) && !statSync(outputDir).isDirectory()) {
     throw new Error("outputDir must be a directory");
@@ -38,6 +40,7 @@ export async function runMeshToCadGeneration(
     opts.runsRoot ?? process.env["PROCEDURA_OUTPUTS_ROOT"] ?? join(PROCEDURA_ROOT, "outputs"),
   );
   if (!isInside(outputDir, runsRoot)) throw new Error("outputDir must be inside runsRoot");
+  if (mapping) await checkMappingEnvironment();
   const reuseDraftPlan = existsSync(join(outputDir, "plan.json")) &&
     existsSync(join(outputDir, "draft.scad"));
   for (const file of STALE_FILES) rmSync(resolve(outputDir, file), { force: true });
@@ -54,6 +57,16 @@ export async function runMeshToCadGeneration(
     throw new Error("Mesh-to-CAD generation requires Plan 2 image.png and plan.json");
   }
   const planText = readFileSync(planPath, "utf8");
+  // Planning has already required and validated the reference root.
+  const mappingCritic = mapping
+    ? makeMeshToCadMappingCritic(
+        new ReferenceAuthority(
+          resolve(opts.referenceRoot ?? process.env["PROCEDURA_REFERENCE_ROOT"]!),
+          [runsRoot, PROCEDURA_ROOT],
+        ),
+        planned.reference.handle,
+      )
+    : undefined;
   const generated = await runMeshToCadProcedura({
     outputDir: planned.outputDir,
     planPath,

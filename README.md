@@ -183,10 +183,30 @@ Without `--refine`, Mesh-to-CAD promotes the Plan 3 draft without the Phase 2 wh
 compile/critic/patch/gate loop and writes its normal `_refine_steps/`,
 `preview_final/`, and `final_summary.txt` artifacts. Exhausting the refine
 budget (`max-steps`) still succeeds when `final.scad` and `final.obj` are
-complete; other refine verdicts fail the command. This is image-space review,
-not 3D source-to-generated measurement. The default path has no whole-model
+complete; other refine verdicts fail the command. A patch call that still fails
+after its internal retries ends refine with verdict `error`. Without
+`--mapping`, this is image-space review, not 3D source-to-generated
+measurement. The default path has no whole-model
 refine loop, closed-loop iteration, four-view/brief/scoring workflow,
 STEP/build123d, or material/texture processing.
+
+Add `--mapping` (requires `--refine`) to run the octree Mapping critic beside
+the visual critic in every refine cycle. It maps the current CAD surface onto
+the private canonical reference, which already uses the normalized frame, and
+passes its text diagnosis to the patch step together with the visual one. Set
+up its Python environment once; the command checks it before any model call:
+
+```bash
+cd experiments/octree-mapping && python3.12 -m venv .venv && .venv/bin/pip install -e . matplotlib
+```
+
+The Mapping Agent receives octree cell evidence and comparison renders derived
+from the private mesh, never the mesh, its path, or the handle. Mapping meshes,
+octree documents, and comparison renders stay under the handle's private
+`workspace/` directory; each refine step in the run directory receives only the
+Mapping text: `mapping.txt`, `mapping_thinking.txt` when the model returns
+reasoning, and the Mapping section of `diagnosis.txt`. A Mapping preparation or
+Mapping model failure ends refine with verdict `error`, and the command fails.
 
 ### The best-quality run
 

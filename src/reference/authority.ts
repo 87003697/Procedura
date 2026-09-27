@@ -156,6 +156,14 @@ export class ReferenceAuthority {
     }));
   }
 
+  /** Private directory beside the canonical mesh for trusted host tools; never publish its contents. */
+  privateWorkspace(handle: string): { dir: string; canonicalPath: string } {
+    const record = this.#record(handle);
+    const dir = join(record.dir, "workspace");
+    mkdirSync(dir, { recursive: true });
+    return { dir, canonicalPath: record.canonicalPath };
+  }
+
   #record(handle: string): PrivateManifest & { dir: string; canonicalPath: string } {
     if (!/^ref_[0-9a-f-]+$/.test(handle)) throw new Error("invalid reference handle");
     const dir = join(this.#root, handle);
